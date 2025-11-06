@@ -1,0 +1,721 @@
+// passman.cpp
+// Build: g++ -std=c++17 -O2 -Wall -lsodium -o passman passman.cpp
+
+#include <sodium.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <map>
+#include <iostream>
+#include <sstream>
+#include <ctime>
+#include <iomanip>
+#include <cerrno>
+
+// -------- Configuration constants --------
+static constexpr const char* VAULT_FILENAME = "vault.bin";
+static constexpr const char* META_FILENAME = "vault.meta"; // stores salt & nonce info securely
+static constexpr const char* AUDIT_LOG = "audit.log";
+static constexpr size_t SALT_LEN = crypto_pwhash_SALTBYTES; // Argon2 salt
+static constexpr size_t KEY_LEN = crypto_aead_xchacha20poly1305_ietf_KEYBYTES;
+static constexpr size_t NONCE_LEN = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+
+// Argon2 parameters (tune for your environment - these are moderate)
+static constexpr unsigned long OPSLIMIT = crypto_pwhash_OPSLIMIT_MODERATE;
+static constexpr size_t MEMLIMIT = crypto_pwhash_MEMLIMIT_MODERATE;
+
+// limits for username/password lengths
+static constexpr size_t MAX_USER_LEN = 256;
+static constexpr size_t MAX_PASS_LEN = 1024;
+static constexpr size_t MAX_LABEL_LEN = 256;
+
+// -------- Utility helpers --------
+static void audit_log(const std::string& entry) {
+    // append entry to audit log with 0600 perms
+    int fd = open(AUDIT_LOG, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR);
+    if (fd < 0) return;
+    time_t t = time(nullptr);
+    char buf[128];
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    std::string line = std::string(buf) + " " + entry + "\n";
+    (void)write(fd, line.c_str(), line.size());
+    close(fd);
+}
+
+// zero and unlock memory safely
+static void secure_free(unsigned char* buf, size_t len) {
+    if (!buf || len == 0) return;
+    sodium_memzero(buf, len);
+    // attempt to munlock if possible
+#if defined(MADV_DONTNEED)
+    munlock(buf, len);
+#endif
+    free(buf);
+}
+
+// get password (no echo) - simple, portable-ish
+static std::string get_password(const char* prompt) {
+    std::string pw;
+    std::cout << prompt;
+    std::fflush(stdout);
+    // turn off echo on POSIX
+    struct termios oldt, newt;
+    if (!isatty(STDIN_FILENO)) {
+        std::getline(std::cin, pw);
+        return pw;
+    }
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~ECHO;
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    std::getline(std::cin, pw);
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    std::cout << "\n";
+    return pw;
+}
+
+// simple base64 - using libsodium helper
+static std::string to_base64(const unsigned char* bin, size_t len) {
+    size_t out_len = sodium_base64_encoded_len(len, sodium_base64_VARIANT_ORIGINAL);
+    std::string out(out_len, '\0');
+    sodium_bin2base64(out.data(), out.size(), bin, len, sodium_base64_VARIANT_ORIGINAL);
+    out.erase(out.find('\0')); // remove trailing nulls
+    return out;
+}
+//    else {
+        // fallback
+//        return "";
+//    }
+//}
+static std::vector<unsigned char> from_base64(const std::string& b64) {
+    std::vector<unsigned char> out(b64.size());
+    size_t out_len = 0;
+    if (sodium_base642bin(out.data(), out.size(), b64.c_str(), b64.size(), NULL, &out_len, NULL, sodium_base64_VARIANT_ORIGINAL) != 0) {
+        return {};
+    }
+    out.resize(out_len);
+    return out;
+}
+
+// -------- Vault layout (high-level) --------
+// vault.bin: contains ciphertext (encrypted blob of serialized entries) produced by AEAD.
+// vault.meta: stores base64(salt) and base64(nonce) and base64(header H) as needed.
+// The encryption key is derived with Argon2id from master password + salt.
+// We always re-randomize a new symmetric key nonce for the whole blob when writing.
+
+// very simple in-memory representation:
+struct Cred {
+    std::string label;   // e.g. "gmail"
+    std::string username;
+    std::string password;
+    std::string notes;
+};
+using Vault = std::map<std::string, Cred>; // key by label
+
+// Serialize/deserialize vault to a simple newline-separated format with escaping.
+static std::string serialize_vault(const Vault& v) {
+    std::ostringstream oss;
+    for (const auto& p : v) {
+        // escape newlines by \\n
+        auto esc = [](const std::string& s)->std::string {
+            std::string r; r.reserve(s.size());
+            for (char c : s) {
+                if (c == '\n') { r += "\\n"; }
+                else if (c == '\\') { r += "\\\\"; }
+                else r.push_back(c);
+            }
+            return r;
+            };
+        oss << p.first << '\t' << esc(p.second.username) << '\t' << esc(p.second.password) << '\t' << esc(p.second.notes) << '\n';
+    }
+    return oss.str();
+}
+static Vault deserialize_vault(const std::string& s) {
+    Vault v;
+    std::istringstream iss(s);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line.empty()) continue;
+        std::vector<std::string> toks;
+        size_t pos = 0, start = 0;
+        while (pos <= line.size()) {
+            if (pos == line.size() || line[pos] == '\t') {
+                toks.push_back(line.substr(start, pos - start));
+                start = pos + 1;
+            }
+            pos++;
+        }
+        auto unesc = [](const std::string& x)->std::string {
+            std::string r; r.reserve(x.size());
+            for (size_t i = 0; i < x.size(); ++i) {
+                if (x[i] == '\\' && i + 1 < x.size()) {
+                    if (x[i + 1] == 'n') { r.push_back('\n'); ++i; }
+                    else if (x[i + 1] == '\\') { r.push_back('\\'); ++i; }
+                    else r.push_back(x[i]);
+                }
+                else r.push_back(x[i]);
+            }
+            return r;
+            };
+        if (toks.size() >= 4) {
+            Cred c{ toks[0], unesc(toks[1]), unesc(toks[2]), unesc(toks[3]) };
+            v[toks[0]] = c;
+        }
+    }
+    return v;
+}
+
+// -------- Core crypto operations --------
+static bool derive_key_from_password(const std::string& pw, const unsigned char salt[SALT_LEN], unsigned char key[KEY_LEN]) {
+    if (pw.empty()) return false;
+    if (crypto_pwhash(key, KEY_LEN,
+        pw.c_str(), pw.size(),
+        salt,
+        OPSLIMIT, MEMLIMIT,
+        crypto_pwhash_ALG_ARGON2ID13) != 0) {
+        return false; // out of memory
+    }
+    return true;
+}
+
+static bool encrypt_vault_blob(const unsigned char key[KEY_LEN], const unsigned char* plaintext, size_t plen,
+    unsigned char** out_ct, size_t* out_ct_len, unsigned char nonce[NONCE_LEN]) {
+    // generate nonce
+    randombytes_buf(nonce, NONCE_LEN);
+    unsigned long long ct_len64 = 0;
+    *out_ct = (unsigned char*)malloc(plen + crypto_aead_xchacha20poly1305_ietf_ABYTES);
+    if (!*out_ct) return false;
+    if (crypto_aead_xchacha20poly1305_ietf_encrypt(*out_ct, &ct_len64,
+        plaintext, plen,
+        NULL, 0, // no associated data
+        NULL, nonce, key) != 0) {
+        sodium_memzero(*out_ct, plen + crypto_aead_xchacha20poly1305_ietf_ABYTES);
+        free(*out_ct);
+        return false;
+    }
+    *out_ct_len = (size_t)ct_len64;
+    return true;
+}
+
+static bool decrypt_vault_blob(const unsigned char key[KEY_LEN], const unsigned char* ct, size_t ct_len,
+    const unsigned char nonce[NONCE_LEN],
+    unsigned char** out_plain, size_t* out_plain_len) {
+    unsigned long long mlen = 0;
+    *out_plain = (unsigned char*)malloc(ct_len); // ciphertext len is >= plaintext
+    if (!*out_plain) return false;
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(*out_plain, &mlen,
+        NULL,
+        ct, ct_len,
+        NULL, 0,
+        nonce, key) != 0) {
+        sodium_memzero(*out_plain, ct_len);
+        free(*out_plain);
+        return false;
+    }
+    *out_plain_len = (size_t)mlen;
+    return true;
+}
+
+// Atomic file write helper (mkstemp + rename)
+static bool atomic_write_file(const std::string& path, const unsigned char* buf, size_t len) {
+    std::string tmpl = path + ".tmpXXXXXX";
+    std::vector<char> temp(tmpl.begin(), tmpl.end());
+    temp.push_back('\0');
+    int fd = mkstemp(temp.data());
+    if (fd < 0) return false;
+    // set perms to 0600
+    fchmod(fd, S_IRUSR | S_IWUSR);
+    ssize_t w = write(fd, buf, len);
+    if (w < 0 || (size_t)w != len) { close(fd); unlink(temp.data()); return false; }
+    fsync(fd);
+    close(fd);
+    if (rename(temp.data(), path.c_str()) != 0) { unlink(temp.data()); return false; }
+    return true;
+}
+
+// load meta (salt & nonce) (meta file format: base64(salt)\nbase64(nonce)\n)
+static bool load_meta(unsigned char salt[SALT_LEN], unsigned char nonce[NONCE_LEN]) {
+    FILE* f = fopen(META_FILENAME, "r");
+    if (!f) return false;
+    char buf[4096];
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return false; }
+    std::string s_salt(buf);
+    s_salt.erase(s_salt.find_last_not_of("\r\n") + 1);
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return false; }
+    std::string s_nonce(buf);
+    s_nonce.erase(s_nonce.find_last_not_of("\r\n") + 1);
+    fclose(f);
+    auto vb = from_base64(s_salt);
+    if (vb.size() != SALT_LEN) return false;
+    memcpy(salt, vb.data(), SALT_LEN);
+    auto vn = from_base64(s_nonce);
+    if (vn.size() != NONCE_LEN) return false;
+    memcpy(nonce, vn.data(), NONCE_LEN);
+    return true;
+}
+
+static bool save_meta(const unsigned char salt[SALT_LEN], const unsigned char nonce[NONCE_LEN]) {
+    std::string b64salt = to_base64(salt, SALT_LEN);
+    std::string b64nonce = to_base64(nonce, NONCE_LEN);
+    std::string content = b64salt + "\n" + b64nonce + "\n";
+    // atomic write
+    return atomic_write_file(META_FILENAME, (const unsigned char*)content.c_str(), content.size());
+}
+
+// load vault ciphertext
+static bool load_vault_ciphertext(std::vector<unsigned char>& ct) {
+    FILE* f = fopen(VAULT_FILENAME, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return false; }
+    fseek(f, 0, SEEK_SET);
+    ct.resize(sz);
+    if (fread(ct.data(), 1, sz, f) != (size_t)sz) { fclose(f); return false; }
+    fclose(f);
+    return true;
+}
+
+// Vault clear utility
+static void secure_clear_vault(Vault& v) {
+    for (auto& p : v) {
+        sodium_memzero((void*)p.second.username.data(), p.second.username.size());
+        sodium_memzero((void*)p.second.password.data(), p.second.password.size());
+        sodium_memzero((void*)p.second.notes.data(), p.second.notes.size());
+    }
+    v.clear();
+}
+
+
+// ---------- CLI / Workflow ----------
+
+static Vault load_vault_with_key(const unsigned char key[KEY_LEN]) {
+    Vault v;
+    std::vector<unsigned char> ct;
+    if (!load_vault_ciphertext(ct)) return v; // empty vault if none
+    unsigned char salt[SALT_LEN], nonce[NONCE_LEN];
+    if (!load_meta(salt, nonce)) return v;
+    unsigned char* plain = nullptr;
+    size_t plain_len = 0;
+    if (!decrypt_vault_blob(key, ct.data(), ct.size(), nonce, &plain, &plain_len)) return v;
+    std::string txt((char*)plain, plain_len);
+    // zero out plain after deserialize
+    v = deserialize_vault(txt);
+    sodium_memzero(plain, plain_len);
+    free(plain);
+    return v;
+}
+
+// ---------- Program flow helpers ----------
+
+static void print_menu() {
+    std::cout << "SecurePass CLI - Menu:\n";
+    std::cout << "1) List credentials\n";
+    std::cout << "2) Add credential (+New)\n";
+    std::cout << "3) Update credential\n";
+    std::cout << "4) Delete credential\n";
+    std::cout << "5) Reveal credential (logs action)\n";
+    std::cout << "6) Copy credential to secure buffer\n";
+    std::cout << "7) Quit\n";
+    std::cout << "8) Delete entire vault / Create new vault\n";
+}
+
+int main() {
+    if (sodium_init() < 0) {
+        std::fprintf(stderr, "libsodium init failed\n");
+        return 1;
+    }
+
+    // Check if vault exists; if not, run init
+    bool vault_exists = (access(VAULT_FILENAME, F_OK) == 0 && access(META_FILENAME, F_OK) == 0);
+    unsigned char salt[SALT_LEN];
+    unsigned char key[KEY_LEN];
+    sodium_memzero(key, KEY_LEN);
+
+    if (!vault_exists) {
+        std::cout << "No vault found. Initialize new vault.\n";
+        // generate salt and ask master password twice
+        randombytes_buf(salt, SALT_LEN);
+        std::string pw1 = get_password("Create master password: ");
+        std::string pw2 = get_password("Confirm master password: ");
+        if (pw1 != pw2) {
+            std::cerr << "Passwords do not match. Exiting.\n";
+            sodium_memzero((void*)pw1.data(), pw1.size());
+            sodium_memzero((void*)pw2.data(), pw2.size());
+            return 2;
+        }
+        if (!derive_key_from_password(pw1, salt, key)) {
+            std::cerr << "Key derivation failed\n";
+            return 2;
+        }
+        // empty vault encrypt
+        Vault v;
+        std::string ser = serialize_vault(v);
+        unsigned char* ct = nullptr;
+        size_t ct_len = 0;
+        unsigned char nonce[NONCE_LEN];
+        if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct, &ct_len, nonce)) {
+            std::cerr << "Encryption failed\n";
+            return 3;
+        }
+        // atomic write vault
+        if (!atomic_write_file(VAULT_FILENAME, ct, ct_len)) {
+            std::cerr << "Failed to write vault\n";
+            sodium_memzero(ct, ct_len);
+            free(ct);
+            return 3;
+        }
+        // save meta (salt + nonce)
+        if (!save_meta(salt, nonce)) {
+            std::cerr << "Failed to write metadata\n";
+            sodium_memzero(ct, ct_len);
+            free(ct);
+            return 4;
+        }
+        sodium_memzero(ct, ct_len);
+        free(ct);
+        sodium_memzero((void*)pw1.data(), pw1.size());
+        sodium_memzero((void*)pw2.data(), pw2.size());
+        sodium_memzero(key, KEY_LEN);
+        std::cout << "Vault initialized. Restart to open.\n";
+        return 0;
+    }
+
+    // Vault exists -> prompt for master password
+    unsigned char nonce[NONCE_LEN];
+    if (!load_meta(salt, nonce)) {
+        std::cerr << "Failed to read vault metadata\n";
+        return 2;
+    }
+
+    unsigned attempts = 0;
+    const unsigned MAX_ATTEMPTS = 5;
+    bool authenticated = false;
+    Vault vault;
+    while (attempts < MAX_ATTEMPTS) {
+        std::string master = get_password("Master password: ");
+        if (!derive_key_from_password(master, salt, key)) {
+            attempts++;
+            audit_log("Failed key-derivation attempt");
+            sodium_memzero((void*)master.data(), master.size());
+            continue;
+        }
+        // try decrypting
+        std::vector<unsigned char> ct;
+        if (!load_vault_ciphertext(ct)) {
+            std::cerr << "Cannot load vault ciphertext\n"; sodium_memzero(key, KEY_LEN); sodium_memzero((void*)master.data(), master.size()); return 2;
+        }
+        unsigned char* plain = nullptr; size_t plain_len = 0;
+        if (decrypt_vault_blob(key, ct.data(), ct.size(), nonce, &plain, &plain_len)) {
+            // success
+            std::string txt((char*)plain, plain_len);
+            vault = deserialize_vault(txt);
+            sodium_memzero(plain, plain_len);
+            free(plain);
+            authenticated = true;
+            sodium_memzero((void*)master.data(), master.size());
+            break;
+        }
+        else {
+            attempts++;
+            audit_log("Failed master password attempt");
+            sodium_memzero((void*)master.data(), master.size());
+            sodium_memzero(key, KEY_LEN);
+        }
+    }
+    if (!authenticated) {
+        std::cerr << "Too many failed attempts; exiting.\n";
+        audit_log("Master password brute-forced or too many attempts -> lockout");
+        return 3;
+    }
+    audit_log("Master password accepted - session opened");
+
+    // session: simple CLI loop
+    bool running = true;
+    while (running) {
+        print_menu();
+        std::cout << "> ";
+        std::string choice;
+        if (!std::getline(std::cin, choice)) break;
+        if (choice == "1") {
+            std::cout << "Stored credentials:\n";
+            for (auto& p : vault) {
+                std::cout << " - " << p.first << " (user: " << p.second.username << ")\n";
+            }
+        }
+        else if (choice == "2") {
+            std::string label, user, pass, notes;
+            std::cout << "+New - Label: "; std::getline(std::cin, label);
+            if (label.empty() || label.size() > MAX_LABEL_LEN) { std::cout << "Invalid label\n"; continue; }
+            std::cout << " Username: "; std::getline(std::cin, user);
+            std::cout << " Password (leave empty to prompt hidden): ";
+            std::string tmp; std::getline(std::cin, tmp);
+            if (tmp.empty()) tmp = get_password("Password: ");
+            pass = tmp;
+            std::cout << " Notes: "; std::getline(std::cin, notes);
+            // validation basics
+            if (user.size() > MAX_USER_LEN || pass.size() > MAX_PASS_LEN) { std::cout << "Input too long\n"; continue; }
+            Cred c{ label, user, pass, notes };
+            vault[label] = c;
+            audit_log("Add credential: " + label);
+            // save immediately (re-encrypt)
+            unsigned char new_nonce[NONCE_LEN];
+            std::string ser = serialize_vault(vault);
+            unsigned char* ct = nullptr; size_t ct_len = 0;
+            if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct, &ct_len, new_nonce)) {
+                std::cerr << "Encryption failed on save\n";
+            }
+            else {
+                if (!atomic_write_file(VAULT_FILENAME, ct, ct_len) || !save_meta(salt, new_nonce)) {
+                    std::cerr << "Failed to persist vault\n";
+                }
+                sodium_memzero(ct, ct_len);
+                free(ct);
+            }
+            sodium_memzero((void*)pass.data(), pass.size());
+        }
+        else if (choice == "3") {
+            std::string label;
+            std::cout << "Update - Label: "; std::getline(std::cin, label);
+            auto it = vault.find(label);
+            if (it == vault.end()) { std::cout << "Not found\n"; continue; }
+            // ask old password for that entry
+            std::string oldpw = get_password("Old password for this entry: ");
+            if (oldpw != it->second.password) {
+                audit_log("Failed update attempt for " + label);
+                std::cout << "Old password mismatch\n";
+                sodium_memzero((void*)oldpw.data(), oldpw.size());
+                continue;
+            }
+            audit_log("Update attempt for " + label);
+            std::string newpw = get_password("New password: ");
+            if (newpw.empty()) { std::cout << "Empty not allowed\n"; sodium_memzero((void*)newpw.data(), newpw.size()); continue; }
+            it->second.password = newpw;
+            audit_log("Update success for " + label);
+            // save
+            unsigned char new_nonce[NONCE_LEN];
+            std::string ser = serialize_vault(vault);
+            unsigned char* ct = nullptr; size_t ct_len = 0;
+            if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct, &ct_len, new_nonce)) {
+                std::cerr << "Encryption failed on save\n";
+            }
+            else {
+                if (!atomic_write_file(VAULT_FILENAME, ct, ct_len) || !save_meta(salt, new_nonce)) {
+                    std::cerr << "Failed to persist vault\n";
+                }
+                sodium_memzero(ct, ct_len);
+                free(ct);
+            }
+            sodium_memzero((void*)oldpw.data(), oldpw.size());
+            sodium_memzero((void*)newpw.data(), newpw.size());
+        }
+        else if (choice == "4") {
+            std::string label;
+            std::cout << "Delete - Label: "; std::getline(std::cin, label);
+            auto it = vault.find(label);
+            if (it == vault.end()) { std::cout << "Not found\n"; continue; }
+            std::string confirm = get_password("Type MASTER password to confirm deletion: ");
+            unsigned char testkey[KEY_LEN];
+            if (!derive_key_from_password(confirm, salt, testkey)) {
+                std::cout << "Derive failed\n";
+                sodium_memzero((void*)confirm.data(), confirm.size());
+                continue;
+            }
+            // attempt to re-decrypt to verify correct master
+            std::vector<unsigned char> ct;
+            if (!load_vault_ciphertext(ct)) { std::cout << "Cannot read vault\n"; sodium_memzero((void*)confirm.data(), confirm.size()); sodium_memzero(testkey, KEY_LEN); continue; }
+            unsigned char* plain = nullptr;
+            size_t plain_len = 0;
+            if (decrypt_vault_blob(testkey, ct.data(), ct.size(), nonce, &plain, &plain_len)) {
+                // good master
+                sodium_memzero(plain, plain_len);
+                free(plain);
+                plain = nullptr;
+                vault.erase(it);
+                audit_log("Deletion success for " + label);
+                // save
+                unsigned char new_nonce[NONCE_LEN];
+                std::string ser = serialize_vault(vault);
+                unsigned char* ct2 = nullptr; size_t ct2_len = 0;
+                if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct2, &ct2_len, new_nonce)) {
+                    std::cerr << "Encryption failed on save\n";
+                }
+                else {
+                    if (!atomic_write_file(VAULT_FILENAME, ct2, ct2_len) || !save_meta(salt, new_nonce)) {
+                        std::cerr << "Failed to persist vault\n";
+                    }
+                    sodium_memzero(ct2, ct2_len);
+                    free(ct2);
+                }
+            }
+            else {
+                audit_log("Deletion attempt failed (wrong master) for " + label);
+                std::cout << "Master password check failed. Not deleted.\n";
+            }
+            sodium_memzero((void*)confirm.data(), confirm.size());
+            sodium_memzero(testkey, KEY_LEN);
+        }
+        else if (choice == "5") {
+            std::string label;
+            std::cout << "Reveal - Label: "; std::getline(std::cin, label);
+            auto it = vault.find(label);
+            if (it == vault.end()) { std::cout << "Not found\n"; continue; }
+            audit_log("Reveal password requested for " + label);
+            std::cout << "Username: " << it->second.username << "\n";
+            std::cout << "Password: " << it->second.password << "\n";
+            std::cout << "(action logged)\n";
+        }
+        else if (choice == "6") {
+            std::string label;
+            std::cout << "Copy - Label: "; std::getline(std::cin, label);
+            auto it = vault.find(label);
+            if (it == vault.end()) { std::cout << "Not found\n"; continue; }
+            audit_log("Copy requested for " + label);
+            // Secure buffer allocation (mlock)
+            size_t len = it->second.password.size();
+            unsigned char* buf = (unsigned char*)malloc(len + 1);
+            if (!buf) { std::cout << "Alloc fail\n"; continue; }
+            memcpy(buf, it->second.password.data(), len);
+            buf[len] = 0;
+#if defined(MADV_DONTNEED)
+            if (mlock(buf, len + 1) != 0) {
+                // not fatal; continue
+            }
+#endif
+            std::cout << "Password copied to secure buffer (NOT system clipboard). Press Enter to clear it now.\n";
+            audit_log("Credential copied to secure buffer for " + label);
+            std::string dummy;
+            std::getline(std::cin, dummy);
+            // clear buffer
+            sodium_memzero(buf, len + 1);
+#if defined(MADV_DONTNEED)
+            munlock(buf, len + 1);
+#endif
+            free(buf);
+            audit_log("Secure buffer cleared for " + label);
+        }
+        else if (choice == "7") {
+            running = false;
+        }
+        else if (choice == "8") {
+            std::cout << "WARNING: This will permanently delete your entire vault!\n";
+            std::cout << "Type DELETE to confirm: ";
+            std::string confirmWord;
+            std::getline(std::cin, confirmWord);
+            if (confirmWord != "DELETE") {
+                std::cout << "Aborted.\n";
+                continue;
+            }
+
+            std::string masterCheck = get_password("Enter master password to confirm: ");
+            unsigned char verifyKey[KEY_LEN];
+            if (!derive_key_from_password(masterCheck, salt, verifyKey)) {
+                sodium_memzero((void*)masterCheck.data(), masterCheck.size());
+                std::cout << "Key derivation failed.\n";
+                continue;
+            }
+
+            // Verify correctness of master password by trying a decrypt
+            std::vector<unsigned char> ct;
+            if (!load_vault_ciphertext(ct)) {
+                std::cout << "No vault file found.\n";
+                sodium_memzero((void*)masterCheck.data(), masterCheck.size());
+                sodium_memzero(verifyKey, KEY_LEN);
+                continue;
+            }
+            unsigned char* plain = nullptr;
+            size_t plain_len = 0;
+            if (!decrypt_vault_blob(verifyKey, ct.data(), ct.size(), nonce, &plain, &plain_len)) {
+                std::cout << "Incorrect master password. Aborted.\n";
+                sodium_memzero((void*)masterCheck.data(), masterCheck.size());
+                sodium_memzero(verifyKey, KEY_LEN);
+                continue;
+            }
+            sodium_memzero(plain, plain_len);
+            free(plain);
+            sodium_memzero((void*)masterCheck.data(), masterCheck.size());
+            sodium_memzero(verifyKey, KEY_LEN);
+
+            // Overwrite vault and meta before deletion
+            auto secure_delete_file = [](const char* path) {
+                FILE* f = fopen(path, "r+");
+                if (f) {
+                    fseek(f, 0, SEEK_END);
+                    long sz = ftell(f);
+                    rewind(f);
+                    std::vector<unsigned char> zeros(sz, 0);
+                    fwrite(zeros.data(), 1, sz, f);
+                    fflush(f);
+                    fsync(fileno(f));
+                    fclose(f);
+                }
+                unlink(path);
+                };
+
+            secure_delete_file(VAULT_FILENAME);
+            secure_delete_file(META_FILENAME);
+
+            secure_clear_vault(vault);
+
+            audit_log("Vault deleted by user request");
+
+            std::cout << "Vault deleted.\n";
+            std::cout << "Do you want to create a new empty vault now? (y/n): ";
+            std::string ans;
+            std::getline(std::cin, ans);
+            if (ans == "y" || ans == "Y") {
+                randombytes_buf(salt, SALT_LEN);
+                std::string pw1 = get_password("Create new master password: ");
+                std::string pw2 = get_password("Confirm new master password: ");
+                if (pw1 != pw2) {
+                    std::cerr << "Passwords do not match. No vault created.\n";
+                    sodium_memzero((void*)pw1.data(), pw1.size());
+                    sodium_memzero((void*)pw2.data(), pw2.size());
+                    continue;
+                }
+                if (!derive_key_from_password(pw1, salt, key)) {
+                    std::cerr << "Key derivation failed.\n";
+                    continue;
+                }
+                Vault newVault;
+                std::string ser = serialize_vault(newVault);
+                unsigned char* ct2 = nullptr; size_t ct2_len = 0; unsigned char newNonce[NONCE_LEN];
+                if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct2, &ct2_len, newNonce)) {
+                    std::cerr << "Encryption failed.\n";
+                    continue;
+                }
+                if (!atomic_write_file(VAULT_FILENAME, ct2, ct2_len) || !save_meta(salt, newNonce)) {
+                    std::cerr << "Failed to save new vault.\n";
+                }
+                else {
+                    std::cout << "New vault created successfully.\n";
+                    audit_log("New vault created after deletion");
+                }
+                sodium_memzero(ct2, ct2_len);
+                free(ct2);
+                sodium_memzero((void*)pw1.data(), pw1.size());
+                sodium_memzero((void*)pw2.data(), pw2.size());
+                sodium_memzero(key, KEY_LEN);
+            }
+        }
+        else {
+            std::cout << "Unknown choice\n";
+        }
+    }
+
+    // Clean up sensitive key materials
+    sodium_memzero(key, KEY_LEN);
+    audit_log("Session closed");
+    std::cout << "Goodbye.\n";
+    return 0;
+}
