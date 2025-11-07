@@ -79,3 +79,9 @@ g++ -std=c++17 -O2 -Wall passman.cpp -lsodium -o passman
 ```
 ./passman
 ```
+
+## Credits
+
+Author of the ICS0022 Secure Programming course is Ali Ghasempour. The project and its requirements are based on 2025 autumn version of the course materials.
+This project's documentation and code comments were partially written with assistance from OpenAI's ChatGPT (GPT-5).
+All source logic, review, and testing were performed by the author.
