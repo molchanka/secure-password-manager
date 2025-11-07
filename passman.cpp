@@ -19,6 +19,7 @@
 #include <ctime>
 #include <iomanip>
 #include <cerrno>
+#include <limits>
 
 // -------- Configuration constants --------
 static constexpr const char* VAULT_FILENAME = "vault.bin";
@@ -27,6 +28,7 @@ static constexpr const char* AUDIT_LOG = "audit.log";
 static constexpr size_t SALT_LEN = crypto_pwhash_SALTBYTES; // Argon2 salt
 static constexpr size_t KEY_LEN = crypto_aead_xchacha20poly1305_ietf_KEYBYTES;
 static constexpr size_t NONCE_LEN = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+static constexpr size_t ABYTES = crypto_aead_xchacha20poly1305_ietf_ABYTES;
 
 // Argon2 parameters (tune for your environment - these are moderate)
 static constexpr unsigned long OPSLIMIT = crypto_pwhash_OPSLIMIT_MODERATE;
@@ -36,6 +38,7 @@ static constexpr size_t MEMLIMIT = crypto_pwhash_MEMLIMIT_MODERATE;
 static constexpr size_t MAX_USER_LEN = 256;
 static constexpr size_t MAX_PASS_LEN = 1024;
 static constexpr size_t MAX_LABEL_LEN = 256;
+static constexpr size_t MAX_VAULT_SIZE = 10 * 1024 * 1024; // 10 MB hard cap
 
 // -------- Utility helpers --------
 static void audit_log(const std::string& entry) {
@@ -100,9 +103,11 @@ static std::string to_base64(const unsigned char* bin, size_t len) {
 static std::vector<unsigned char> from_base64(const std::string& b64) {
     std::vector<unsigned char> out(b64.size());
     size_t out_len = 0;
-    if (sodium_base642bin(out.data(), out.size(), b64.c_str(), b64.size(), NULL, &out_len, NULL, sodium_base64_VARIANT_ORIGINAL) != 0) {
-        return {};
-    }
+    if (b64.empty()) return {};
+	if (sodium_base642bin(out.data(), out.size(), b64.c_str(), b64.size(), NULL, &out_len, NULL, sodium_base64_VARIANT_ORIGINAL) != 0) {
+		return {};
+	}
+	if (out_len > out.size()) return {}; // sanity guard (no malformed base64 strings)
     out.resize(out_len);
     return out;
 }
@@ -113,13 +118,15 @@ static std::vector<unsigned char> from_base64(const std::string& b64) {
 // The encryption key is derived with Argon2id from master password + salt.
 // We always re-randomize a new symmetric key nonce for the whole blob when writing.
 
-// very simple in-memory representation:
+using byte = unsigned char;
+
 struct Cred {
     std::string label;   // e.g. "gmail"
     std::string username;
     std::string password;
     std::string notes;
 };
+
 using Vault = std::map<std::string, Cred>; // key by label
 
 // Serialize/deserialize vault to a simple newline-separated format with escaping.
@@ -193,6 +200,7 @@ static bool encrypt_vault_blob(const unsigned char key[KEY_LEN], const unsigned 
     // generate nonce
     randombytes_buf(nonce, NONCE_LEN);
     unsigned long long ct_len64 = 0;
+	if (plen > SIZE_MAX - crypto_aead_xchacha20poly1305_ietf_ABYTES) return false; // Prevent overflow
     *out_ct = (unsigned char*)malloc(plen + crypto_aead_xchacha20poly1305_ietf_ABYTES);
     if (!*out_ct) return false;
     if (crypto_aead_xchacha20poly1305_ietf_encrypt(*out_ct, &ct_len64,
@@ -276,15 +284,25 @@ static bool save_meta(const unsigned char salt[SALT_LEN], const unsigned char no
 static bool load_vault_ciphertext(std::vector<unsigned char>& ct) {
     FILE* f = fopen(VAULT_FILENAME, "rb");
     if (!f) return false;
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
     long sz = ftell(f);
     if (sz < 0) { fclose(f); return false; }
-    fseek(f, 0, SEEK_SET);
-    ct.resize(sz);
-    if (fread(ct.data(), 1, sz, f) != (size_t)sz) { fclose(f); return false; }
+    if ((unsigned long)sz > MAX_VAULT_SIZE) {  // Prevent integer overflow & large files
+        std::cerr << "Vault file too large or corrupt.\n";
+        fclose(f);
+        return false;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+    size_t size = static_cast<size_t>(sz);
+    ct.resize(size);
+    if (size > 0) {
+        size_t r = fread(ct.data(), 1, size, f);
+        if (r != size) { fclose(f); ct.clear(); return false; }
+    }
     fclose(f);
     return true;
 }
+
 
 // Vault clear utility
 static void secure_clear_vault(Vault& v) {
@@ -369,6 +387,12 @@ int main() {
             return 3;
         }
         // atomic write vault
+		if (ct_len > MAX_VAULT_SIZE) { 
+			std::cerr << "Ciphertext size unexpectedly large; aborting.\n";
+			sodium_memzero(ct, ct_len);
+			free(ct);
+			return 3;
+		}
         if (!atomic_write_file(VAULT_FILENAME, ct, ct_len)) {
             std::cerr << "Failed to write vault\n";
             sodium_memzero(ct, ct_len);
@@ -471,6 +495,10 @@ int main() {
             // save immediately (re-encrypt)
             unsigned char new_nonce[NONCE_LEN];
             std::string ser = serialize_vault(vault);
+			if (ser.size() > MAX_VAULT_SIZE / 2) {
+				std::cerr << "Vault data too large; refusing to encrypt.\n";
+				continue;
+			}
             unsigned char* ct = nullptr; size_t ct_len = 0;
             if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct, &ct_len, new_nonce)) {
                 std::cerr << "Encryption failed on save\n";
@@ -499,12 +527,26 @@ int main() {
             }
             audit_log("Update attempt for " + label);
             std::string newpw = get_password("New password: ");
-            if (newpw.empty()) { std::cout << "Empty not allowed\n"; sodium_memzero((void*)newpw.data(), newpw.size()); continue; }
+            if (newpw.empty()) {
+				std::cout << "Empty not allowed\n";
+				sodium_memzero((void*)newpw.data(), newpw.size());
+				continue;
+			}
+			if (newpw.size() > MAX_PASS_LEN) {
+				std::cout << "Password too long.\n";
+				sodium_memzero((void*)newpw.data(), newpw.size());
+				sodium_memzero((void*)oldpw.data(), oldpw.size());
+				continue;
+			}
             it->second.password = newpw;
             audit_log("Update success for " + label);
             // save
             unsigned char new_nonce[NONCE_LEN];
             std::string ser = serialize_vault(vault);
+			if (ser.size() > MAX_VAULT_SIZE / 2) {
+				std::cerr << "Vault data too large; refusing to encrypt.\n";
+				continue;
+			}
             unsigned char* ct = nullptr; size_t ct_len = 0;
             if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct, &ct_len, new_nonce)) {
                 std::cerr << "Encryption failed on save\n";
@@ -546,6 +588,10 @@ int main() {
                 // save
                 unsigned char new_nonce[NONCE_LEN];
                 std::string ser = serialize_vault(vault);
+				if (ser.size() > MAX_VAULT_SIZE / 2) {
+					std::cerr << "Vault data too large; refusing to encrypt.\n";
+					continue;
+				}
                 unsigned char* ct2 = nullptr; size_t ct2_len = 0;
                 if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct2, &ct2_len, new_nonce)) {
                     std::cerr << "Encryption failed on save\n";
@@ -653,6 +699,11 @@ int main() {
                     fseek(f, 0, SEEK_END);
                     long sz = ftell(f);
                     rewind(f);
+					if (sz <= 0 || (unsigned long)sz > MAX_VAULT_SIZE) {
+						fclose(f);
+						unlink(path);
+						return;
+					} // prevents an attacker from replacing vault.bin with a giant file
                     std::vector<unsigned char> zeros(sz, 0);
                     fwrite(zeros.data(), 1, sz, f);
                     fflush(f);
