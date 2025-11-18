@@ -1,5 +1,5 @@
 // passman.cpp
-// Build: g++ -std=c++17 -O2 -Wall -lsodium -o passman passman.cpp
+// Build: g++ -std=c++17 -O2 -Wall passman.cpp -lsodium -o passman
 
 #include <sodium.h>
 #include <sys/stat.h>
@@ -45,7 +45,7 @@ static constexpr size_t MAX_VAULT_SIZE = 10 * 1024 * 1024; // 10 MB hard cap
 // Logging
 enum class LogLevel { INFO, WARN, ERROR, ALERT }; // levels
 
-static void audit_log(LogLevel lvl, const std::string& entry) {
+static void audit_log_level(LogLevel lvl, const std::string& entry) {
     // append entry to audit log with 0600 perms
     int fd = open(AUDIT_LOG, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR);
     if (fd < 0) return;
@@ -56,19 +56,18 @@ static void audit_log(LogLevel lvl, const std::string& entry) {
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
     const char* lname = "INFO";
     switch (lvl) {
-        case LogLevel::INFO:  lname = "INFO"; break;
-        case LogLevel::WARN:  lname = "WARN"; break;
-        case LogLevel::ERROR: lname = "ERROR"; break;
-        case LogLevel::ALERT: lname = "ALERT"; break;
+    case LogLevel::INFO:  lname = "INFO"; break;
+    case LogLevel::WARN:  lname = "WARN"; break;
+    case LogLevel::ERROR: lname = "ERROR"; break;
+    case LogLevel::ALERT: lname = "ALERT"; break;
     }
     std::string line = std::string(buf) + " [---" + lname + "---] " + entry + "\n";
     // 
     (void)write(fd, line.c_str(), line.size());
-    (void)w; //
     close(fd);
 }
 
-static void audit_log(const std::string &entry) { audit_log_level(LogLevel::INFO, entry); }
+static void audit_log(const std::string& entry) { audit_log_level(LogLevel::INFO, entry); }
 
 // zero and unlock memory safely
 static void secure_free(unsigned char* buf, size_t len) {
@@ -119,10 +118,10 @@ static std::vector<unsigned char> from_base64(const std::string& b64) {
     std::vector<unsigned char> out(b64.size());
     size_t out_len = 0;
     if (b64.empty()) return {};
-	if (sodium_base642bin(out.data(), out.size(), b64.c_str(), b64.size(), NULL, &out_len, NULL, sodium_base64_VARIANT_ORIGINAL) != 0) {
-		return {};
-	}
-	if (out_len > out.size()) return {}; // sanity guard (no malformed base64 strings)
+    if (sodium_base642bin(out.data(), out.size(), b64.c_str(), b64.size(), NULL, &out_len, NULL, sodium_base64_VARIANT_ORIGINAL) != 0) {
+        return {};
+    }
+    if (out_len > out.size()) return {}; // sanity guard (no malformed base64 strings)
     out.resize(out_len);
     return out;
 }
@@ -215,7 +214,7 @@ static bool encrypt_vault_blob(const unsigned char key[KEY_LEN], const unsigned 
     // generate nonce
     randombytes_buf(nonce, NONCE_LEN);
     unsigned long long ct_len64 = 0;
-	if (plen > SIZE_MAX - crypto_aead_xchacha20poly1305_ietf_ABYTES) return false; // Prevent overflow
+    if (plen > SIZE_MAX - crypto_aead_xchacha20poly1305_ietf_ABYTES) return false; // Prevent overflow
     *out_ct = (unsigned char*)malloc(plen + crypto_aead_xchacha20poly1305_ietf_ABYTES);
     if (!*out_ct) return false;
     if (crypto_aead_xchacha20poly1305_ietf_encrypt(*out_ct, &ct_len64,
@@ -406,13 +405,13 @@ int main() {
             return 3;
         }
         // atomic write vault
-		if (ct_len > MAX_VAULT_SIZE) { 
+        if (ct_len > MAX_VAULT_SIZE) {
             audit_log_level(LogLevel::ERROR, "Vault init: ciphertext too large");
             std::cerr << "An unexpected error occurred. Check audit log.\n";
-			sodium_memzero(ct, ct_len);
-			free(ct);
-			return 3;
-		}
+            sodium_memzero(ct, ct_len);
+            free(ct);
+            return 3;
+        }
         if (!atomic_write_file(VAULT_FILENAME, ct, ct_len) || !save_meta(salt, nonce)) {
             audit_log_level(LogLevel::ERROR, "Vault init: saving vault/meta failed");
             std::cerr << "An unexpected error occurred. Check audit log.\n";
@@ -448,8 +447,8 @@ int main() {
         std::string master = get_password("Master password: ");
         if (!derive_key_from_password(master, salt, key)) {
             attempts++;
-            audit_log_level(LogLevel::WARN, "Empty master password input")
-            sodium_memzero((void*)master.data(), master.size());
+            audit_log_level(LogLevel::WARN, "Empty master password input");
+                sodium_memzero((void*)master.data(), master.size());
             continue;
         }
         // try decrypting
@@ -461,7 +460,7 @@ int main() {
             sodium_memzero((void*)master.data(), master.size());
             return 2;
         }
-        unsigned char*plain = nullptr; size_t plain_len = 0;
+        unsigned char* plain = nullptr; size_t plain_len = 0;
         if (decrypt_vault_blob(key, ct.data(), ct.size(), nonce, &plain, &plain_len)) {
             // success
             std::string txt((char*)plain, plain_len);
@@ -523,11 +522,11 @@ int main() {
             // save immediately (re-encrypt)
             unsigned char new_nonce[NONCE_LEN];
             std::string ser = serialize_vault(vault);
-			if (ser.size() > MAX_VAULT_SIZE / 2) {
-				audit_log_level(LogLevel::ERROR, "serialize_vault produced excessively large output");
+            if (ser.size() > MAX_VAULT_SIZE / 2) {
+                audit_log_level(LogLevel::ERROR, "serialize_vault produced excessively large output");
                 std::cerr << "An unexpected error occurred. Check audit log.\n";
-				continue;
-			}
+                continue;
+            }
             unsigned char* ct = nullptr; size_t ct_len = 0;
             if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct, &ct_len, new_nonce)) {
                 audit_log_level(LogLevel::ERROR, "Encryption failed on save (add credential)");
@@ -560,23 +559,23 @@ int main() {
             }
             audit_log_level(LogLevel::INFO, "Update attempt for " + label);
             std::string newpw = get_password("New password: ");
-            if (newpw.empty()) || newpw.size() > MAX_PASS_LEN) {
+            if (newpw.empty() || newpw.size() > MAX_PASS_LEN) {
                 std::cout << "Invalid new password\n";
-				sodium_memzero((void*)newpw.data(), newpw.size());
-				sodium_memzero((void*)oldpw.data(), oldpw.size());
-				continue;
-			}
+                sodium_memzero((void*)newpw.data(), newpw.size());
+                sodium_memzero((void*)oldpw.data(), oldpw.size());
+                continue;
+            }
             it->second.password = newpw;
             audit_log_level(LogLevel::INFO, "Update success for " + label);
 
             // save
             unsigned char new_nonce[NONCE_LEN];
             std::string ser = serialize_vault(vault);
-			if (ser.size() > MAX_VAULT_SIZE / 2) {
+            if (ser.size() > MAX_VAULT_SIZE / 2) {
                 audit_log_level(LogLevel::ERROR, "serialize_vault too large on update");
                 std::cerr << "An unexpected error occurred. Check audit log.\n";
-				continue;
-			}
+                continue;
+            }
             unsigned char* ct = nullptr; size_t ct_len = 0;
             if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct, &ct_len, new_nonce)) {
                 audit_log_level(LogLevel::ERROR, "Encryption failed on save (update)");
@@ -599,6 +598,13 @@ int main() {
             auto it = vault.find(label);
             if (it == vault.end()) { std::cout << "Not found\n"; continue; }
             std::string confirm = get_password("Type MASTER password to confirm deletion: ");
+
+            if (!load_meta(salt, nonce)) {
+                audit_log_level(LogLevel::WARN, "Failed to reload meta before credential deletion");
+                std::cerr << "An unexpected error occurred. Check audit log.\n";
+                continue;
+            }
+
             unsigned char testkey[KEY_LEN];
             if (!derive_key_from_password(confirm, salt, testkey)) {
                 audit_log_level(LogLevel::WARN, "Deletion: key derivation failed while verifying master");
@@ -627,11 +633,11 @@ int main() {
                 // save
                 unsigned char new_nonce[NONCE_LEN];
                 std::string ser = serialize_vault(vault);
-				if (ser.size() > MAX_VAULT_SIZE / 2) {
-                    LogLevel::ERROR, "serialize_vault too large during deletion save");
+                if (ser.size() > MAX_VAULT_SIZE / 2) {
+                    audit_log_level(LogLevel::ERROR, "serialize_vault too large during deletion save");
                     std::cerr << "An unexpected error occurred. Check audit log.\n";
-					continue;
-				}
+                    continue;
+                }
                 unsigned char* ct2 = nullptr; size_t ct2_len = 0;
                 if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct2, &ct2_len, new_nonce)) {
                     audit_log_level(LogLevel::ERROR, "Encryption failed on save (delete credential)");
@@ -639,7 +645,7 @@ int main() {
                 }
                 else {
                     if (!atomic_write_file(VAULT_FILENAME, ct2, ct2_len) || !save_meta(salt, new_nonce)) {
-                        LogLevel::ERROR, "Failed to persist vault (delete credential)");
+                        audit_log_level(LogLevel::ERROR, "Failed to persist vault (delete credential)");
                         std::cerr << "An unexpected error occurred. Check audit log.\n";
                     }
                     sodium_memzero(ct2, ct2_len);
@@ -711,6 +717,13 @@ int main() {
 
             std::string masterCheck = get_password("Enter master password to confirm: ");
             unsigned char verifyKey[KEY_LEN];
+
+            if (!load_meta(salt, nonce)) {
+                audit_log_level(LogLevel::WARN, "Failed to reload meta before deletion");
+                std::cerr << "An unexpected error occurred. Check audit log.\n";
+                continue;
+            }
+
             if (!derive_key_from_password(masterCheck, salt, verifyKey)) {
                 sodium_memzero((void*)masterCheck.data(), masterCheck.size());
                 audit_log_level(LogLevel::WARN, "Vault delete: key derivation failed during verification");
@@ -748,11 +761,11 @@ int main() {
                     fseek(f, 0, SEEK_END);
                     long sz = ftell(f);
                     rewind(f);
-					if (sz <= 0 || (unsigned long)sz > MAX_VAULT_SIZE) {
-						fclose(f);
-						unlink(path);
-						return;
-					} // prevents an attacker from replacing vault.bin with a giant file
+                    if (sz <= 0 || (unsigned long)sz > MAX_VAULT_SIZE) {
+                        fclose(f);
+                        unlink(path);
+                        return;
+                    } // prevents an attacker from replacing vault.bin with a giant file
                     std::vector<unsigned char> zeros(sz, 0);
                     fwrite(zeros.data(), 1, sz, f);
                     fflush(f);
@@ -815,6 +828,9 @@ int main() {
                 sodium_memzero((void*)pw1.data(), pw1.size());
                 sodium_memzero((void*)pw2.data(), pw2.size());
                 sodium_memzero(key, KEY_LEN);
+            }
+            else if (ans == "n" || ans == "N") {
+                running = false;
             }
         }
         else {
