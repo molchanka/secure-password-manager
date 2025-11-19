@@ -40,6 +40,8 @@ static constexpr size_t MAX_PASS_LEN = 1024;
 static constexpr size_t MAX_LABEL_LEN = 256;
 static constexpr size_t MAX_VAULT_SIZE = 10 * 1024 * 1024; // 10 MB hard cap
 
+using byte = unsigned char;
+
 // -------- Utility helpers --------
 
 // Logging
@@ -118,8 +120,9 @@ static std::string to_base64(const byte* bin, size_t len) {
     return out;
 }
 
-static std::vector<unsigned char> from_base64(const std::string& b64) {
-    std::vector<unsigned char> out(b64.size());
+static std::vector<byte> from_base64(const std::string& b64) {
+    size_t max_out = b64.size();
+    std::vector<byte> out(max_out);
     size_t out_len = 0;
     if (b64.empty()) return {};
     if (sodium_base642bin(out.data(), out.size(), b64.c_str(), b64.size(), NULL, &out_len, NULL, sodium_base64_VARIANT_ORIGINAL) != 0) {
@@ -130,13 +133,30 @@ static std::vector<unsigned char> from_base64(const std::string& b64) {
     return out;
 }
 
+static int cleanup_and_exit(int code, Vault& vault, unsigned char key[KEY_LEN], unsigned char salt[SALT_LEN], unsigned char nonce[NONCE_LEN]) {
+    // wipe vault entries
+    for (auto& p : vault) {
+        if (!p.second.username.empty()) sodium_memzero(&p.second.username[0], p.second.username.size());
+        if (!p.second.password.empty()) sodium_memzero(&p.second.password[0], p.second.password.size());
+        if (!p.second.notes.empty()) sodium_memzero(&p.second.notes[0], p.second.notes.size());
+    }
+    vault.clear();
+
+    sodium_memzero(key, KEY_LEN);
+    sodium_memzero(salt, SALT_LEN);
+    sodium_memzero(nonce, NONCE_LEN);
+
+    audit_log_level(LogLevel::INFO, std::string("Session closed with code ") + std::to_string(code));
+    if (code != 0) std::cerr << "An unexpected error occurred. Check audit log for details.\n";
+    return code;
+}
+
 // -------- Vault layout (high-level) --------
 // vault.bin: contains ciphertext (encrypted blob of serialized entries) produced by AEAD.
 // vault.meta: stores base64(salt) and base64(nonce) and base64(header H) as needed.
 // The encryption key is derived with Argon2id from master password + salt.
 // We always re-randomize a new symmetric key nonce for the whole blob when writing.
 
-using byte = unsigned char;
 
 struct Cred {
     std::string label;   // e.g. "gmail"
