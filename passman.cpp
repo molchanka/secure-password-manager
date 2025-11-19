@@ -58,8 +58,11 @@ enum class LogLevel { INFO, WARN, ERROR, ALERT }; // levels
 
 static void audit_log_level(LogLevel lvl, const std::string& entry) {
     // append entry to audit log with 0600 perms
-    int fd = open(AUDIT_LOG, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR);
-    if (fd < 0) return;
+    int fd = open(AUDIT_LOG, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        std::cerr << "open audit log failed" << strerror(errno) << "\n";
+        return;
+    }
     time_t t = time(nullptr);
     char buf[64];
     struct tm tm;
@@ -67,15 +70,18 @@ static void audit_log_level(LogLevel lvl, const std::string& entry) {
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
     const char* lname = "INFO";
     switch (lvl) {
-    case LogLevel::INFO:  lname = "INFO"; break;
-    case LogLevel::WARN:  lname = "WARN"; break;
-    case LogLevel::ERROR: lname = "ERROR"; break;
-    case LogLevel::ALERT: lname = "ALERT"; break;
+        case LogLevel::INFO:  lname = "INFO"; break;
+        case LogLevel::WARN:  lname = "WARN"; break;
+        case LogLevel::ERROR: lname = "ERROR"; break;
+        case LogLevel::ALERT: lname = "ALERT"; break;
     }
-    std::string line = std::string(buf) + " [---" + lname + "---] " + entry + "\n";
-    // 
-    (void)write(fd, line.c_str(), line.size());
-    close(fd);
+    std::string line = std::string(buf) + " [" + lname + "] " + entry + "\n";
+    if (write(fd, line.c_str(), line.size()) < 0) {
+        std::cerr << "write audit log failed" << strerror(errno) << "\n";
+    }
+    if (close(fd) != 0) {
+        std::cerr << "close audit log failed" << strerror(errno) << "\n";
+    }
 }
 
 static void audit_log(const std::string& entry) { audit_log_level(LogLevel::INFO, entry); }
@@ -283,29 +289,31 @@ static bool atomic_write_file(const std::string& path, const byte* buf, size_t l
     temp.push_back('\0');
     int fd = mkostemp(temp.data(), O_CLOEXEC);
     if (fd < 0) {
-        audit_log_level(LogLevel::ERROR, std::string("mkstemp failed: ") + strerror(errno));
+        std::cerr << "mkostemp failed: " << strerror(errno) << "\n";
         return false;
     }
     // set perms to 0600
     if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
-        audit_log_level(LogLevel::WARN, std::string("fchmod failed: ") + strerror(errno));
-        close(fd); unlink(temp.data()); return false;
+        std::cerr << "fchmod failed: " << strerror(errno) << "\n";
+        close(fd);
+        unlink(temp.data());
+        return false;
     }
     ssize_t w = write(fd, buf, len);
     if (w < 0 || (size_t)w != len) {
-        audit_log_level(LogLevel::ERROR, std::string("write to temp failed: ") + strerror(errno));
+        std::cerr << "audit log write failed: " << strerror(errno) << "\n";
         close(fd);
         unlink(temp.data());
         return false;
     }
     if (fsync(fd) != 0) {
-        audit_log_level(LogLevel::WARN, std::string("fsync failed: ") + strerror(errno));
+        std::cerr << "fsync failed: " << strerror(errno) << "\n";
     }
     if (close(fd) != 0) {
-        audit_log_level(LogLevel::WARN, std::string("close failed: ") + strerror(errno));
+        std::cerr << "audit log close failed: " << strerror(errno) << "\n";
     }
     if (rename(temp.data(), path.c_str()) != 0) {
-        audit_log_level(LogLevel::ERROR, std::string("rename failed: ") + strerror(errno));
+        std::cerr << "rename failed: " << strerror(errno) << "\n";
         unlink(temp.data());
         return false;
     }
