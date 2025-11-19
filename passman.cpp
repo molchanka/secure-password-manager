@@ -272,19 +272,43 @@ static bool decrypt_vault_blob(const unsigned char key[KEY_LEN], const unsigned 
 }
 
 // Atomic file write helper (mkstemp + rename)
-static bool atomic_write_file(const std::string& path, const unsigned char* buf, size_t len) {
+static bool atomic_write_file(const std::string& path, const byte* buf, size_t len) {
+    if (!buf) return false;
+    if (len > MAX_VAULT_SIZE) {
+        audit_log_level(LogLevel::ERROR, "atomic_write_file: attempt to write huge file");
+        return false;
+    }
     std::string tmpl = path + ".tmpXXXXXX";
     std::vector<char> temp(tmpl.begin(), tmpl.end());
     temp.push_back('\0');
-    int fd = mkstemp(temp.data());
-    if (fd < 0) return false;
+    int fd = mkostemp(temp.data(), O_CLOEXEC);
+    if (fd < 0) {
+        audit_log_level(LogLevel::ERROR, std::string("mkstemp failed: ") + strerror(errno));
+        return false;
+    }
     // set perms to 0600
-    fchmod(fd, S_IRUSR | S_IWUSR);
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        audit_log_level(LogLevel::WARN, std::string("fchmod failed: ") + strerror(errno));
+        close(fd); unlink(temp.data()); return false;
+    }
     ssize_t w = write(fd, buf, len);
-    if (w < 0 || (size_t)w != len) { close(fd); unlink(temp.data()); return false; }
-    fsync(fd);
-    close(fd);
-    if (rename(temp.data(), path.c_str()) != 0) { unlink(temp.data()); return false; }
+    if (w < 0 || (size_t)w != len) {
+        audit_log_level(LogLevel::ERROR, std::string("write to temp failed: ") + strerror(errno));
+        close(fd);
+        unlink(temp.data());
+        return false;
+    }
+    if (fsync(fd) != 0) {
+        audit_log_level(LogLevel::WARN, std::string("fsync failed: ") + strerror(errno));
+    }
+    if (close(fd) != 0) {
+        audit_log_level(LogLevel::WARN, std::string("close failed: ") + strerror(errno));
+    }
+    if (rename(temp.data(), path.c_str()) != 0) {
+        audit_log_level(LogLevel::ERROR, std::string("rename failed: ") + strerror(errno));
+        unlink(temp.data());
+        return false;
+    }
     return true;
 }
 
