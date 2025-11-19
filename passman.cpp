@@ -91,7 +91,10 @@ static std::string get_password(const char* prompt) {
         std::getline(std::cin, pw);
         return pw;
     }
-    tcgetattr(STDIN_FILENO, &oldt);
+    if (tcgetattr(STDIN_FILENO, &oldt) == -1) {
+        std::getline(std::cin, pw);
+        return pw;
+    }
     newt = oldt;
     newt.c_lflag &= ~ECHO;
     tcsetattr(STDIN_FILENO, TCSANOW, &newt);
