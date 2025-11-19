@@ -155,7 +155,6 @@ static int cleanup_and_exit(int code, Vault& vault, unsigned char key[KEY_LEN], 
 // vault.bin: contains ciphertext (encrypted blob of serialized entries) produced by AEAD.
 // vault.meta: stores base64(salt) and base64(nonce) and base64(header H) as needed.
 // The encryption key is derived with Argon2id from master password + salt.
-// We always re-randomize a new symmetric key nonce for the whole blob when writing.
 
 
 struct Cred {
@@ -395,9 +394,11 @@ int main() {
 
     // Check if vault exists; if not, run init
     bool vault_exists = (access(VAULT_FILENAME, F_OK) == 0 && access(META_FILENAME, F_OK) == 0);
-    unsigned char salt[SALT_LEN];
-    unsigned char key[KEY_LEN];
+    byte salt[SALT_LEN];
+    byte key[KEY_LEN];
     sodium_memzero(key, KEY_LEN);
+    byte nonce[NONCE_LEN];
+    sodium_memzero(nonce, NONCE_LEN);
 
     if (!vault_exists) {
         std::cout << "No vault found. Initialize new vault.\n";
@@ -410,12 +411,12 @@ int main() {
             std::cerr << "Passwords do not match. Exiting.\n";
             sodium_memzero((void*)pw1.data(), pw1.size());
             sodium_memzero((void*)pw2.data(), pw2.size());
-            return 2;
+            return cleanup_and_exit(2, vault, key, salt, nonce);
         }
         if (!derive_key_from_password(pw1, salt, key)) {
             audit_log_level(LogLevel::ERROR, "Vault init: key derivation failed");
             std::cerr << "An unexpected error occurred. Check audit log.\n";
-            return 2;
+            return cleanup_and_exit(2, vault, key, salt, nonce);
         }
         // empty vault encrypt
         Vault v;
@@ -426,7 +427,7 @@ int main() {
         if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct, &ct_len, nonce)) {
             audit_log_level(LogLevel::ERROR, "Vault init: encrypt_vault_blob failed");
             std::cerr << "An unexpected error occurred. Check audit log.\n";
-            return 3;
+            return cleanup_and_exit(3, vault, key, salt, nonce);
         }
         // atomic write vault
         if (ct_len > MAX_VAULT_SIZE) {
@@ -434,14 +435,14 @@ int main() {
             std::cerr << "An unexpected error occurred. Check audit log.\n";
             sodium_memzero(ct, ct_len);
             free(ct);
-            return 3;
+            return cleanup_and_exit(3, vault, key, salt, nonce);
         }
         if (!atomic_write_file(VAULT_FILENAME, ct, ct_len) || !save_meta(salt, nonce)) {
             audit_log_level(LogLevel::ERROR, "Vault init: saving vault/meta failed");
             std::cerr << "An unexpected error occurred. Check audit log.\n";
             sodium_memzero(ct, ct_len);
             free(ct);
-            return 3;
+            return cleanup_and_exit(3, vault, key, salt, nonce);
         }
         sodium_memzero(ct, ct_len);
         free(ct);
@@ -458,7 +459,7 @@ int main() {
     if (!load_meta(salt, nonce)) {
         audit_log_level(LogLevel::ERROR, "Failed to load vault metadata");
         std::cerr << "An unexpected error occurred. Check audit log.\n";
-        return 2;
+        return cleanup_and_exit(2, vault, key, salt, nonce);
     }
 
     unsigned attempts = 0;
@@ -482,7 +483,7 @@ int main() {
             std::cerr << "An unexpected error occurred. Check audit log.\n";
             sodium_memzero(key, KEY_LEN);
             sodium_memzero((void*)master.data(), master.size());
-            return 2;
+            return cleanup_and_exit(2, vault, key, salt, nonce);
         }
         unsigned char* plain = nullptr; size_t plain_len = 0;
         if (decrypt_vault_blob(key, ct.data(), ct.size(), nonce, &plain, &plain_len)) {
@@ -506,7 +507,7 @@ int main() {
     if (!authenticated) {
         audit_log_level(LogLevel::ALERT, "Too many failed master attempts - lockout");
         std::cerr << "Too many failed attempts; exiting.\n";
-        return 3;
+        return cleanup_and_exit(3, vault, key, salt, nonce);
     }
     audit_log("Master password accepted - session opened");
 
@@ -862,9 +863,7 @@ int main() {
         }
     }
 
-    // Clean up sensitive key materials
-    sodium_memzero(key, KEY_LEN);
-    audit_log("Session closed");
+    audit_log_level(LogLevel::INFO, "Session closed");
     std::cout << "Goodbye.\n";
-    return 0;
+    return cleanup_and_exit(0, vault, key, salt, nonce);
 }
