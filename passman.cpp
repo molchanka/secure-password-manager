@@ -42,6 +42,15 @@ static constexpr size_t MAX_VAULT_SIZE = 10 * 1024 * 1024; // 10 MB hard cap
 
 using byte = unsigned char;
 
+struct Cred {
+    std::string label;   // e.g. "gmail"
+    std::string username;
+    std::string password;
+    std::string notes;
+};
+
+using Vault = std::map<std::string, Cred>; // key by label
+
 // -------- Utility helpers --------
 
 // Logging
@@ -156,15 +165,6 @@ static int cleanup_and_exit(int code, Vault& vault, unsigned char key[KEY_LEN], 
 // vault.meta: stores base64(salt) and base64(nonce) and base64(header H) as needed.
 // The encryption key is derived with Argon2id from master password + salt.
 
-
-struct Cred {
-    std::string label;   // e.g. "gmail"
-    std::string username;
-    std::string password;
-    std::string notes;
-};
-
-using Vault = std::map<std::string, Cred>; // key by label
 
 // Serialize/deserialize vault to a simple newline-separated format with escaping.
 static std::string serialize_vault(const Vault& v) {
@@ -392,13 +392,16 @@ int main() {
         return 1;
     }
 
-    // Check if vault exists; if not, run init
-    bool vault_exists = (access(VAULT_FILENAME, F_OK) == 0 && access(META_FILENAME, F_OK) == 0);
+    
+    Vault vault;
     byte salt[SALT_LEN];
     byte key[KEY_LEN];
     sodium_memzero(key, KEY_LEN);
     byte nonce[NONCE_LEN];
     sodium_memzero(nonce, NONCE_LEN);
+
+    // Check if vault exists; if not, run init
+    bool vault_exists = (access(VAULT_FILENAME, F_OK) == 0 && access(META_FILENAME, F_OK) == 0);
 
     if (!vault_exists) {
         std::cout << "No vault found. Initialize new vault.\n";
@@ -421,12 +424,13 @@ int main() {
         // empty vault encrypt
         Vault v;
         std::string ser = serialize_vault(v);
-        unsigned char* ct = nullptr;
+        byte* ct = nullptr;
         size_t ct_len = 0;
-        unsigned char nonce[NONCE_LEN];
-        if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct, &ct_len, nonce)) {
+        byte new_nonce[NONCE_LEN];
+        if (!encrypt_vault_blob(key, (const byte*)ser.data(), ser.size(), &ct, &ct_len, new_nonce)) {
             audit_log_level(LogLevel::ERROR, "Vault init: encrypt_vault_blob failed");
             std::cerr << "An unexpected error occurred. Check audit log.\n";
+            sodium_memzero(new_nonce, NONCE_LEN);
             return cleanup_and_exit(3, vault, key, salt, nonce);
         }
         // atomic write vault
@@ -437,11 +441,12 @@ int main() {
             free(ct);
             return cleanup_and_exit(3, vault, key, salt, nonce);
         }
-        if (!atomic_write_file(VAULT_FILENAME, ct, ct_len) || !save_meta(salt, nonce)) {
+        if (!atomic_write_file(VAULT_FILENAME, ct, ct_len) || !save_meta(salt, new_nonce)) {
             audit_log_level(LogLevel::ERROR, "Vault init: saving vault/meta failed");
             std::cerr << "An unexpected error occurred. Check audit log.\n";
             sodium_memzero(ct, ct_len);
             free(ct);
+            sodium_memzero(new_nonce, NONCE_LEN);
             return cleanup_and_exit(3, vault, key, salt, nonce);
         }
         sodium_memzero(ct, ct_len);
@@ -455,7 +460,6 @@ int main() {
     }
 
     // Vault exists -> prompt for master password
-    unsigned char nonce[NONCE_LEN];
     if (!load_meta(salt, nonce)) {
         audit_log_level(LogLevel::ERROR, "Failed to load vault metadata");
         std::cerr << "An unexpected error occurred. Check audit log.\n";
@@ -465,8 +469,6 @@ int main() {
     unsigned attempts = 0;
     const unsigned MAX_ATTEMPTS = 5;
     bool authenticated = false;
-
-    Vault vault;
 
     while (attempts < MAX_ATTEMPTS) {
         std::string master = get_password("Master password: ");
