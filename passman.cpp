@@ -105,18 +105,19 @@ static std::string get_password(const char* prompt) {
 }
 
 // simple base64 - using libsodium helper
-static std::string to_base64(const unsigned char* bin, size_t len) {
+static std::string to_base64(const byte* bin, size_t len) {
+    if (!bin) return "";
     size_t out_len = sodium_base64_encoded_len(len, sodium_base64_VARIANT_ORIGINAL);
-    std::string out(out_len, '\0');
-    sodium_bin2base64(out.data(), out.size(), bin, len, sodium_base64_VARIANT_ORIGINAL);
-    out.erase(out.find('\0')); // remove trailing nulls
+    if (out_len == 0) return "";
+    std::string out;
+    out.resize(out_len);
+    sodium_bin2base64(reinterpret_cast<char*>(&out[0]), out_len, bin, len, sodium_base64_VARIANT_ORIGINAL);
+    // trim at first null
+    size_t pos = out.find('\0');
+    if (pos != std::string::npos) out.resize(pos);
     return out;
 }
-//    else {
-        // fallback
-//        return "";
-//    }
-//}
+
 static std::vector<unsigned char> from_base64(const std::string& b64) {
     std::vector<unsigned char> out(b64.size());
     size_t out_len = 0;
