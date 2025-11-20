@@ -263,11 +263,12 @@ static bool encrypt_vault_blob(const byte key[KEY_LEN], const byte *plaintext, s
     return true;
 }
 
-static bool decrypt_vault_blob(const unsigned char key[KEY_LEN], const unsigned char* ct, size_t ct_len,
-    const unsigned char nonce[NONCE_LEN],
-    unsigned char** out_plain, size_t* out_plain_len) {
+static bool decrypt_vault_blob(const byte key[KEY_LEN], const byte *ct, size_t ct_len,
+    const byte nonce[NONCE_LEN], byte **out_plain, size_t* out_plain_len) {
+    if (!ct || ct_len < ABYTES) { audit_log_level(LogLevel::WARN, "decrypt_vault_blob: ct too small"); return false; }
+    *out_plain = (byte*)malloc(ct_len); // ciphertext len is >= plaintext
+    if (!*out_plain) { audit_log_level(LogLevel::ERROR, "decrypt_vault_blob: malloc failed"); return false; }
     unsigned long long mlen = 0;
-    *out_plain = (unsigned char*)malloc(ct_len); // ciphertext len is >= plaintext
     if (!*out_plain) return false;
     if (crypto_aead_xchacha20poly1305_ietf_decrypt(*out_plain, &mlen,
         NULL,
@@ -276,6 +277,8 @@ static bool decrypt_vault_blob(const unsigned char key[KEY_LEN], const unsigned 
         nonce, key) != 0) {
         sodium_memzero(*out_plain, ct_len);
         free(*out_plain);
+        *out_plain = nullptr;
+        audit_log_level(LogLevel::WARN, "decrypt_vault_blob: authentication failed");
         return false;
     }
     *out_plain_len = (size_t)mlen;
