@@ -173,20 +173,37 @@ static int cleanup_and_exit(int code, Vault& vault, unsigned char key[KEY_LEN], 
 
 
 // Serialize/deserialize vault to a simple newline-separated format with escaping.
+static std::string escape_str(const std::string& s) {
+    std::string r; r.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c == '\n') { r += "\\n"; }
+        else if (c == '\\') { r += "\\\\"; }
+        else r.push_back(c);
+    }
+    return r;
+}
+
+static std::string unescape_str(const std::string& x) {
+    std::string r; r.reserve(x.size());
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (x[i] == '\\' && i + 1 < x.size()) {
+            if (x[i + 1] == 'n') { r.push_back('\n'); ++i; }
+            else if (x[i + 1] == '\\') { r.push_back('\\'); ++i; }
+            else r.push_back(x[i]);
+        }
+        else r.push_back(x[i]);
+    }
+    return r;
+}
+
 static std::string serialize_vault(const Vault& v) {
     std::ostringstream oss;
     for (const auto& p : v) {
         // escape newlines by \\n
-        auto esc = [](const std::string& s)->std::string {
-            std::string r; r.reserve(s.size());
-            for (char c : s) {
-                if (c == '\n') { r += "\\n"; }
-                else if (c == '\\') { r += "\\\\"; }
-                else r.push_back(c);
-            }
-            return r;
-            };
-        oss << p.first << '\t' << esc(p.second.username) << '\t' << esc(p.second.password) << '\t' << esc(p.second.notes) << '\n';
+        oss << p.first << '\t'
+            << escape_str(p.second.username) << '\t'
+            << escape_str(p.second.password) << '\t'
+            << escape_str(p.second.notes) << '\n';
     }
     return oss.str();
 }
@@ -197,29 +214,20 @@ static Vault deserialize_vault(const std::string& s) {
     while (std::getline(iss, line)) {
         if (line.empty()) continue;
         std::vector<std::string> toks;
-        size_t pos = 0, start = 0;
-        while (pos <= line.size()) {
+        size_t start = 0;
+        for (size_t pos = 0; pos <= line.size(); ++pos) {
             if (pos == line.size() || line[pos] == '\t') {
                 toks.push_back(line.substr(start, pos - start));
                 start = pos + 1;
             }
-            pos++;
         }
-        auto unesc = [](const std::string& x)->std::string {
-            std::string r; r.reserve(x.size());
-            for (size_t i = 0; i < x.size(); ++i) {
-                if (x[i] == '\\' && i + 1 < x.size()) {
-                    if (x[i + 1] == 'n') { r.push_back('\n'); ++i; }
-                    else if (x[i + 1] == '\\') { r.push_back('\\'); ++i; }
-                    else r.push_back(x[i]);
-                }
-                else r.push_back(x[i]);
-            }
-            return r;
-            };
         if (toks.size() >= 4) {
-            Cred c{ toks[0], unesc(toks[1]), unesc(toks[2]), unesc(toks[3]) };
-            v[toks[0]] = c;
+            Cred c{ toks[0], unescape_str(toks[1]), unescape_str(toks[2]), unescape_str(toks[3]) };
+            v[toks[0]] = std::move(c);
+        }
+        else {
+            // malformed line -> skip and log
+            audit_log_level(LogLevel::WARN, "deserialize_vault: skipped malformed line");
         }
     }
     return v;
