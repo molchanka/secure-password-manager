@@ -233,6 +233,7 @@ static bool derive_key_from_password(const std::string& pw, const byte salt[SALT
         salt,
         OPSLIMIT, MEMLIMIT,
         crypto_pwhash_ALG_ARGON2ID13) != 0) {
+        audit_log_level(LogLevel::ERROR, "crypto_pwhash failed");
         return false; // out of memory
     }
     return true;
