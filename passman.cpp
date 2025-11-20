@@ -97,7 +97,7 @@ static void secure_free(unsigned char* buf, size_t len) {
     free(buf);
 }
 
-// get password (no echo) - simple, portable-ish
+// get password
 static std::string get_password(const char* prompt) {
     std::string pw;
     std::cout << prompt;
@@ -105,19 +105,29 @@ static std::string get_password(const char* prompt) {
     // turn off echo on POSIX
     struct termios oldt, newt;
     if (!isatty(STDIN_FILENO)) {
-        std::getline(std::cin, pw);
+        std::string tmp;
+        if (!std::getline(std::cin, tmp)) return pw;
+        rv.assign(tmp.begin(), tmp.end());
         return pw;
     }
-    if (tcgetattr(STDIN_FILENO, &oldt) == -1) {
-        std::getline(std::cin, pw);
+    if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
+        std::string tmp;
+        if (!std::getline(std::cin, tmp)) return pw;
+        pw.assign(tmp.begin(), tmp.end());
         return pw;
     }
     newt = oldt;
     newt.c_lflag &= ~ECHO;
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-    std::getline(std::cin, pw);
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) != 0) {
+        audit_log_level(LogLevel::WARN, "tcsetattr failed while disabling echo");
+    }
+    std::string tmp;
+    std::getline(std::cin, tmp);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &oldt) != 0) {
+        audit_log_level(LogLevel::WARN, "tcsetattr failed while restoring attrs");
+    }
     std::cout << "\n";
+    rv.assign(tmp.begin(), tmp.end());
     return pw;
 }
 
