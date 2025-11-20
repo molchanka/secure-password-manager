@@ -226,7 +226,7 @@ static Vault deserialize_vault(const std::string& s) {
 }
 
 // -------- Core crypto operations --------
-static bool derive_key_from_password(const std::string& pw, const unsigned char salt[SALT_LEN], unsigned char key[KEY_LEN]) {
+static bool derive_key_from_password(const std::string& pw, const byte salt[SALT_LEN], byte key[KEY_LEN]) {
     if (pw.empty()) return false;
     if (crypto_pwhash(key, KEY_LEN,
         pw.c_str(), pw.size(),
@@ -238,20 +238,24 @@ static bool derive_key_from_password(const std::string& pw, const unsigned char 
     return true;
 }
 
-static bool encrypt_vault_blob(const unsigned char key[KEY_LEN], const unsigned char* plaintext, size_t plen,
-    unsigned char** out_ct, size_t* out_ct_len, unsigned char nonce[NONCE_LEN]) {
+static bool encrypt_vault_blob(const byte key[KEY_LEN], const byte *plaintext, size_t plen,
+    byte **out_ct, size_t *out_ct_len, byte nonce[NONCE_LEN]) {
+    if (!plaintext) return false;
+    if (plen > MAX_VAULT_SIZE) { audit_log_level(LogLevel::ERROR, "encrypt_vault_blob: plaintext too large"); return false; }
+    if (plen > SIZE_MAX - ABYTES) { audit_log_level(LogLevel::ERROR, "encrypt_vault_blob: size overflow guard"); return false; }
     // generate nonce
     randombytes_buf(nonce, NONCE_LEN);
     unsigned long long ct_len64 = 0;
-    if (plen > SIZE_MAX - crypto_aead_xchacha20poly1305_ietf_ABYTES) return false; // Prevent overflow
-    *out_ct = (unsigned char*)malloc(plen + crypto_aead_xchacha20poly1305_ietf_ABYTES);
-    if (!*out_ct) return false;
-    if (crypto_aead_xchacha20poly1305_ietf_encrypt(*out_ct, &ct_len64,
-        plaintext, plen,
-        NULL, 0, // no associated data
-        NULL, nonce, key) != 0) {
-        sodium_memzero(*out_ct, plen + crypto_aead_xchacha20poly1305_ietf_ABYTES);
+    size_t alloc_len = plen + ABYTES;
+    *out_ct = (byte*)malloc(alloc_len);
+    if (!*out_ct) {
+        audit_log_level(LogLevel::ERROR, "encrypt_vault_blob: malloc failed");
+        return false;
+    }
+    if (crypto_aead_xchacha20poly1305_ietf_encrypt(*out_ct, &ct_len64, plaintext, plen, NULL, 0, NULL, nonce, key) != 0) {
+        sodium_memzero(*out_ct, alloc_len);
         free(*out_ct);
+        audit_log_level(LogLevel::ERROR, "encrypt_vault_blob: encrypt failed");
         return false;
     }
     *out_ct_len = (size_t)ct_len64;
