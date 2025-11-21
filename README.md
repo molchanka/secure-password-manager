@@ -6,7 +6,8 @@ Secure password manager for personal use, written using C++ and secured using va
 
 - Argon2id key derivation for master passwords
 - XChaCha20-Poly1305 authenticated encryption for all vault data
-- SHA-256 used for logging and internal integrity checks
+- AEAD authentication (via Poly1305) provides integrity for all vault data.
+
 
 ### Workflow
 
@@ -27,6 +28,7 @@ Secure password manager for personal use, written using C++ and secured using va
 
 ### Future roadmap
 
+- SHA-256 for log integrity checks
 - Cross-platform clipboard integration (timed clear)
 - Session timeout auto-lock
 - Multi-vault support
@@ -57,14 +59,18 @@ This is a learning-based implementation, not a production password manager. It d
 
 | Principle | Implementation |
 | -------- | ------- |
-| Input validation | Max length checks, no unsafe string functions (gets, strcpy, etc.) |
-| Logging and auditability | All sensitive actions recorded in audit.log with a timestamp |
-| Secure deletion | Overwrite before unlink(), in-memory wipe on vault delete |
+| Input validation | Max length, empty and malformation checks, no unsafe string functions (gets, strcpy, etc.), avoiding undefined behavior in escaping logic |
+| Logging and auditability | All sensitive actions recorded in audit.log with a timestamp, write failures handled, no sensitive data included |
+| Secure deletion (file) | Overwrite with zeroes before unlink(), atomic rename to avoid partial deletion, metadata clear |
+| Secure deletion (memory) | All sensitive strings wiped with `sodium_memzero`, secure buffers mlocked where supported |
 | Least privilege | Files created with 0600 permissions only |
-| TOCTOU avoidance | Atomic file writes via mkstemp and rename() |
+| TOCTOU avoidance | Atomic file writes via `mkostemp()`, `fsync()` and `rename()` |
 | Fail-secure | Locked on failed password attempts, memory wiped on any operation fail, no partial writes |
 | Integer Overflow Protection | Overflow guards, file size validation before allocation or vectors resizing |
-
+| Silent Error Messaging | No sensitive error messages (e.g., not “Argon2 failed at step X” but instead “An unexpected error occurred”) |
+| Cryptographic Correctness | Argon2id with user-configured parameters, salts always random, new nonce for every save, AEAD XChaCha20-Poly1305 auth checks verified |
+| Replay and Corruption Detection | AEAD authentication ensures tampering causes clean failure, vault won't load if ciphertext or metadata mismatched |
+| Controlled Resource Usage | Hard limits on vault size (10MB), password, username, label lengths, avoiding unbounded growth, fail safely on giant or corrupted files |
 
 ## Build instructions
 
@@ -79,9 +85,3 @@ g++ -std=c++17 -O2 -Wall passman.cpp -lsodium -o passman
 ```
 ./passman
 ```
-
-## Credits
-
-Author of the ICS0022 Secure Programming course is Ali Ghasempour. The project and its requirements are based on 2025 autumn version of the course materials.
-This project's documentation and code comments were partially written with assistance from OpenAI's ChatGPT (GPT-5).
-All source logic, review, and testing were performed by the author.
