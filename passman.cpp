@@ -51,9 +51,8 @@ struct Cred {
 
 using Vault = std::map<std::string, Cred>; // key by label
 
-// -------- Utility helpers --------
 
-// Logging
+// -------- Logging (levels) --------
 enum class LogLevel { INFO, WARN, ERROR, ALERT }; // levels
 
 static void audit_log_level(LogLevel lvl, const std::string& entry) {
@@ -86,6 +85,7 @@ static void audit_log_level(LogLevel lvl, const std::string& entry) {
 
 static void audit_log(const std::string& entry) { audit_log_level(LogLevel::INFO, entry); }
 
+
 // zero and unlock memory safely
 static void secure_free(unsigned char* buf, size_t len) {
     if (!buf || len == 0) return;
@@ -96,6 +96,7 @@ static void secure_free(unsigned char* buf, size_t len) {
 #endif
     free(buf);
 }
+
 
 // get password
 static std::string get_password(const char* prompt) {
@@ -131,7 +132,8 @@ static std::string get_password(const char* prompt) {
     return pw;
 }
 
-// simple base64 - using libsodium helper
+
+// ---------- Base64 helpers ----------
 static std::string to_base64(const byte* bin, size_t len) {
     if (!bin) return "";
     size_t out_len = sodium_base64_encoded_len(len, sodium_base64_VARIANT_ORIGINAL);
@@ -144,6 +146,7 @@ static std::string to_base64(const byte* bin, size_t len) {
     if (pos != std::string::npos) out.resize(pos);
     return out;
 }
+
 
 static std::vector<byte> from_base64(const std::string& b64) {
     size_t max_out = b64.size();
@@ -158,7 +161,10 @@ static std::vector<byte> from_base64(const std::string& b64) {
     return out;
 }
 
-static int cleanup_and_exit(int code, Vault& vault, unsigned char key[KEY_LEN], unsigned char salt[SALT_LEN], unsigned char nonce[NONCE_LEN]) {
+
+// ---------- Centralized cleanup & exit ----------
+static int cleanup_and_exit(int code, Vault& vault, unsigned char key[KEY_LEN],
+                            unsigned char salt[SALT_LEN], unsigned char nonce[NONCE_LEN]) {
     // wipe vault entries
     for (auto& p : vault) {
         if (!p.second.username.empty()) sodium_memzero(&p.second.username[0], p.second.username.size());
@@ -176,13 +182,8 @@ static int cleanup_and_exit(int code, Vault& vault, unsigned char key[KEY_LEN], 
     return code;
 }
 
-// -------- Vault layout (high-level) --------
-// vault.bin: contains ciphertext (encrypted blob of serialized entries) produced by AEAD.
-// vault.meta: stores base64(salt) and base64(nonce) and base64(header H) as needed.
-// The encryption key is derived with Argon2id from master password + salt.
 
-
-// Serialize/deserialize vault to a simple newline-separated format with escaping.
+// -------- Vault --------
 static std::string escape_str(const std::string& s) {
     std::string r; r.reserve(s.size());
     for (unsigned char c : s) {
@@ -192,6 +193,7 @@ static std::string escape_str(const std::string& s) {
     }
     return r;
 }
+
 
 static std::string unescape_str(const std::string& x) {
     std::string r; r.reserve(x.size());
@@ -206,6 +208,7 @@ static std::string unescape_str(const std::string& x) {
     return r;
 }
 
+
 static std::string serialize_vault(const Vault& v) {
     std::ostringstream oss;
     for (const auto& p : v) {
@@ -217,6 +220,8 @@ static std::string serialize_vault(const Vault& v) {
     }
     return oss.str();
 }
+
+
 static Vault deserialize_vault(const std::string& s) {
     Vault v;
     std::istringstream iss(s);
@@ -243,11 +248,12 @@ static Vault deserialize_vault(const std::string& s) {
     return v;
 }
 
-// -------- Core crypto operations --------
-static bool derive_key_from_password(const std::string& pw, const byte salt[SALT_LEN], byte key[KEY_LEN]) {
-    if (pw.empty()) return false;
+
+// -------- Crypto helpers --------
+static bool derive_key_from_password(const byte* pw, const byte salt[SALT_LEN], byte key[KEY_LEN]) {
+    if (!pw || pw_len == 0) return false;
     if (crypto_pwhash(key, KEY_LEN,
-        pw.c_str(), pw.size(),
+        reinterpret_cast<const char*>(pw), pw_len,
         salt,
         OPSLIMIT, MEMLIMIT,
         crypto_pwhash_ALG_ARGON2ID13) != 0) {
@@ -257,8 +263,9 @@ static bool derive_key_from_password(const std::string& pw, const byte salt[SALT
     return true;
 }
 
+
 static bool encrypt_vault_blob(const byte key[KEY_LEN], const byte *plaintext, size_t plen,
-    byte **out_ct, size_t *out_ct_len, byte nonce[NONCE_LEN]) {
+                                byte **out_ct, size_t *out_ct_len, byte nonce[NONCE_LEN]) {
     if (!plaintext) return false;
     if (plen > MAX_VAULT_SIZE) { audit_log_level(LogLevel::ERROR, "encrypt_vault_blob: plaintext too large"); return false; }
     if (plen > SIZE_MAX - ABYTES) { audit_log_level(LogLevel::ERROR, "encrypt_vault_blob: size overflow guard"); return false; }
@@ -281,8 +288,9 @@ static bool encrypt_vault_blob(const byte key[KEY_LEN], const byte *plaintext, s
     return true;
 }
 
+
 static bool decrypt_vault_blob(const byte key[KEY_LEN], const byte *ct, size_t ct_len,
-    const byte nonce[NONCE_LEN], byte **out_plain, size_t* out_plain_len) {
+                                const byte nonce[NONCE_LEN], byte **out_plain, size_t* out_plain_len) {
     if (!ct || ct_len < ABYTES) { audit_log_level(LogLevel::WARN, "decrypt_vault_blob: ct too small"); return false; }
     *out_plain = (byte*)malloc(ct_len); // ciphertext len is >= plaintext
     if (!*out_plain) { audit_log_level(LogLevel::ERROR, "decrypt_vault_blob: malloc failed"); return false; }
@@ -303,7 +311,8 @@ static bool decrypt_vault_blob(const byte key[KEY_LEN], const byte *ct, size_t c
     return true;
 }
 
-// Atomic file write helper (mkstemp + rename)
+
+// -------- Atomic file write helper -------- 
 static bool atomic_write_file(const std::string& path, const byte* buf, size_t len) {
     if (!buf) return false;
     if (len > MAX_VAULT_SIZE) {
@@ -346,7 +355,21 @@ static bool atomic_write_file(const std::string& path, const byte* buf, size_t l
     return true;
 }
 
-// load meta (salt & nonce) (meta file format: base64(salt)\nbase64(nonce)\n)
+
+static bool save_meta(const byte salt[SALT_LEN], const byte nonce[NONCE_LEN]) {
+    if (!salt || !nonce) return false;
+    std::string b64salt = to_base64(salt, SALT_LEN);
+    std::string b64nonce = to_base64(nonce, NONCE_LEN);
+    std::string content = b64salt + "\n" + b64nonce + "\n";
+    // atomic write
+    if (!atomic_write_file(META_FILENAME, reinterpret_cast<const byte*>(content.data()), content.size())) {
+        audit_log_level(LogLevel::ERROR, "save_meta: atomic write failed");
+        return false;
+    }
+    return true;
+}
+
+
 static bool load_meta(byte salt[SALT_LEN], byte nonce[NONCE_LEN]) {
     FILE* f = fopen(META_FILENAME, "r");
     if (!f) {
@@ -389,20 +412,7 @@ static bool load_meta(byte salt[SALT_LEN], byte nonce[NONCE_LEN]) {
     return true;
 }
 
-static bool save_meta(const byte salt[SALT_LEN], const byte nonce[NONCE_LEN]) {
-    if (!salt || !nonce) return false;
-    std::string b64salt = to_base64(salt, SALT_LEN);
-    std::string b64nonce = to_base64(nonce, NONCE_LEN);
-    std::string content = b64salt + "\n" + b64nonce + "\n";
-    // atomic write
-    if (!atomic_write_file(META_FILENAME, reinterpret_cast<const byte*>(content.data()), content.size())) {
-        audit_log_level(LogLevel::ERROR, "save_meta: atomic write failed");
-        return false;
-    }
-    return true;
-}
 
-// load vault ciphertext
 static bool load_vault_ciphertext(std::vector<byte>& ct) {
     FILE* f = fopen(VAULT_FILENAME, "rb");
     if (!f) return false;
@@ -443,7 +453,7 @@ static bool load_vault_ciphertext(std::vector<byte>& ct) {
 }
 
 
-// Vault clear utility
+// ---------- Small utilities ----------
 static void secure_clear_vault(Vault& v) {
     for (auto& p : v) {
         if (!p.second.username.empty()) sodium_memzero(&p.second.username[0], p.second.username.size());
@@ -473,7 +483,9 @@ static Vault load_vault_with_key(const unsigned char key[KEY_LEN]) {
     return v;
 }
 
+
 // ---------- Program flow helpers ----------
+
 
 static void print_menu() {
     std::cout << "SecurePass CLI - Menu:\n";
@@ -487,13 +499,14 @@ static void print_menu() {
     std::cout << "8) Delete entire vault / Create new vault\n";
 }
 
+
+// ---------- Main program ----------
 int main() {
     if (sodium_init() < 0) {
         std::fprintf(stderr, "An unexpected error occurred. Check audit log for details.\n");
         audit_log_level(LogLevel::ERROR, "libsodium init failed");
         return 1;
     }
-
     
     Vault vault;
     byte salt[SALT_LEN];
