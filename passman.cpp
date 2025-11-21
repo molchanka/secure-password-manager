@@ -77,6 +77,7 @@ static bool valid_password(const std::string& s) {
     return true;
 }
 
+
 // ---------- Secure input (returns vector<byte> so we can wipe reliably) ----------
 static std::vector<byte> get_password_bytes(const char* prompt) {
     std::vector<byte> rv;
@@ -118,6 +119,8 @@ static std::string passwd_vec_to_string_and_wipe(std::vector<byte>& v) {
     sodium_memzero(v.data(), v.size());
     v.clear();
     return s;
+}
+
 
 // -------- Logging (levels) --------
 enum class LogLevel { INFO, WARN, ERROR, ALERT }; // levels
@@ -519,6 +522,27 @@ static bool load_vault_ciphertext(std::vector<byte>& ct) {
     return true;
 }
 
+static void secure_delete_file(const char* path) {
+    if (!path) return;
+    FILE* f = fopen(path, "r+");
+    if (!f) { unlink(path); return; }
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long lsz = ftell(f);
+        if (lsz > 0 && (unsigned long)lsz <= MAX_VAULT_SIZE) {
+            rewind(f);
+            std::vector<byte> zeros((size_t)lsz, 0);
+            size_t w = fwrite(zeros.data(), 1, zeros.size(), f);
+            if (w != zeros.size()) audit_log_level(LogLevel::WARN, "secure_delete_file: fwrite short");
+            fflush(f);
+            fsync(fileno(f));
+        }
+        else {
+            audit_log_level(LogLevel::WARN, "secure_delete_file: file size invalid or too large");
+        }
+    }
+    fclose(f);
+    if (unlink(path) != 0) audit_log_level(LogLevel::WARN, std::string("unlink failed: ") + strerror(errno));
+}
 
 // ---------- Small utilities ----------
 static void secure_clear_vault(Vault& v) {
@@ -529,27 +553,6 @@ static void secure_clear_vault(Vault& v) {
     }
     v.clear();
 }
-
-
-// ---------- CLI / Workflow ----------
-
-static Vault load_vault_with_key(const unsigned char key[KEY_LEN]) {
-    Vault v;
-    std::vector<unsigned char> ct;
-    if (!load_vault_ciphertext(ct)) return v; // empty vault if none
-    unsigned char salt[SALT_LEN], nonce[NONCE_LEN];
-    if (!load_meta(salt, nonce)) return v;
-    unsigned char* plain = nullptr;
-    size_t plain_len = 0;
-    if (!decrypt_vault_blob(key, ct.data(), ct.size(), nonce, &plain, &plain_len)) return v;
-    std::string txt((char*)plain, plain_len);
-    // zero out plain after deserialize
-    v = deserialize_vault(txt);
-    sodium_memzero(plain, plain_len);
-    free(plain);
-    return v;
-}
-
 
 // ---------- Program flow helpers ----------
 
