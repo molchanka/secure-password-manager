@@ -446,9 +446,9 @@ static bool load_vault_ciphertext(std::vector<byte>& ct) {
 // Vault clear utility
 static void secure_clear_vault(Vault& v) {
     for (auto& p : v) {
-        sodium_memzero((void*)p.second.username.data(), p.second.username.size());
-        sodium_memzero((void*)p.second.password.data(), p.second.password.size());
-        sodium_memzero((void*)p.second.notes.data(), p.second.notes.size());
+        if (!p.second.username.empty()) sodium_memzero(&p.second.username[0], p.second.username.size());
+        if (!p.second.password.empty()) sodium_memzero(&p.second.password[0], p.second.password.size());
+        if (!p.second.notes.empty()) sodium_memzero(&p.second.notes[0], p.second.notes.size());
     }
     v.clear();
 }
