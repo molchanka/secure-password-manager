@@ -1031,58 +1031,7 @@ int main() {
             audit_log_level(LogLevel::ALERT, "Vault deleted by user request and memory cleared");
 
             std::cout << "Vault deleted.\n";
-            std::cout << "Do you want to create a new empty vault now? (y/n): ";
-            std::string ans;
-            std::getline(std::cin, ans);
-            if (ans == "y" || ans == "Y") {
-                randombytes_buf(salt, SALT_LEN);
-                std::string pw1 = get_password("Create new master password: ");
-                std::string pw2 = get_password("Confirm new master password: ");
-                if (pw1 != pw2) {
-                    audit_log_level(LogLevel::WARN, "Vault reinit: passwords did not match");
-                    std::cerr << "Passwords do not match. No vault created.\n";
-                    sodium_memzero(pw1.data(), pw1.size());
-                    sodium_memzero(pw2.data(), pw2.size());
-                    continue;
-                }
-                if (!derive_key_from_password(pw1, salt, key)) {
-                    audit_log_level(LogLevel::ERROR, "Vault reinit: key derivation failed");
-                    std::cerr << "An unexpected error occurred. Check audit log.\n";
-                    continue;
-                }
-                Vault newVault;
-                std::string ser = serialize_vault(newVault);
-                if (ser.size() > MAX_VAULT_SIZE / 2) {
-                    audit_log_level(LogLevel::ERROR, "Vault reinit: serialized size too large");
-                    std::cerr << "An unexpected error occurred. Check audit log.\n";
-                    continue;
-                }
-                unsigned char* ct2 = nullptr; size_t ct2_len = 0; unsigned char newNonce[NONCE_LEN];
-                if (!encrypt_vault_blob(key, (const unsigned char*)ser.data(), ser.size(), &ct2, &ct2_len, newNonce)) {
-                    audit_log_level(LogLevel::ERROR, "Vault reinit: encryption failed");
-                    std::cerr << "An unexpected error occurred. Check audit log.\n";
-                    continue;
-                }
-                if (!atomic_write_file(VAULT_FILENAME, ct2, ct2_len) || !save_meta(salt, newNonce)) {
-                    audit_log_level(LogLevel::ERROR, "Vault reinit: failed to save new vault/meta");
-                    std::cerr << "An unexpected error occurred. Check audit log.\n";
-                }
-                else {
-                    audit_log_level(LogLevel::INFO, "New vault created after deletion");
-                    std::cout << "New vault created successfully.\n";
-                }
-                sodium_memzero(ct2, ct2_len);
-                free(ct2);
-                sodium_memzero((void*)pw1.data(), pw1.size());
-                sodium_memzero((void*)pw2.data(), pw2.size());
-                sodium_memzero(key, KEY_LEN);
-            }
-            else if (ans == "n" || ans == "N") {
-                running = false;
-            }
-        }
-        else {
-            std::cout << "Unknown choice\n";
+            running = false;
         }
     }
 
