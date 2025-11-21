@@ -52,6 +52,73 @@ struct Cred {
 using Vault = std::map<std::string, Cred>; // key by label
 
 
+// ---------- Helpers: input validation ----------
+static bool contains_control_or_tab_or_null(const std::string& s) {
+    for (unsigned char c : s) {
+        if (c == '\t' || c == '\0') return true;
+        if ((c < 0x20) && c != '\n' && c != '\r') return true; // other control chars
+    }
+    return false;
+}
+
+static bool valid_label_or_username(const std::string& s) {
+    if (s.empty()) return false;
+    if (s.size() > MAX_LABEL_LEN) return false;
+    if (contains_control_or_tab_or_null(s)) return false;
+    // disallow whitespace-only
+    if (std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c); })) return false;
+    return true;
+}
+
+static bool valid_password(const std::string& s) {
+    if (s.empty()) return false;
+    if (s.size() > MAX_PASS_LEN) return false;
+    if (contains_control_or_tab_or_null(s)) return false;
+    return true;
+}
+
+// ---------- Secure input (returns vector<byte> so we can wipe reliably) ----------
+static std::vector<byte> get_password_bytes(const char* prompt) {
+    std::vector<byte> rv;
+    std::cout << prompt;
+    std::fflush(stdout);
+    if (!isatty(STDIN_FILENO)) {
+        std::string tmp;
+        if (!std::getline(std::cin, tmp)) return rv;
+        rv.assign(tmp.begin(), tmp.end());
+        return rv;
+    }
+    struct termios oldt, newt;
+    if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
+        // fallback
+        std::string tmp;
+        if (!std::getline(std::cin, tmp)) return rv;
+        rv.assign(tmp.begin(), tmp.end());
+        return rv;
+    }
+    newt = oldt;
+    newt.c_lflag &= ~ECHO;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) != 0) {
+        // fallback - log but do not expose
+        audit_log_level(LogLevel::WARN, "tcsetattr failed while disabling echo");
+    }
+    std::string tmp;
+    std::getline(std::cin, tmp);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &oldt) != 0) {
+        audit_log_level(LogLevel::WARN, "tcsetattr failed while restoring attrs");
+    }
+    std::cout << "\n";
+    rv.assign(tmp.begin(), tmp.end());
+    return rv;
+}
+
+// helper to convert vector<byte> to std::string (copy) and wipe the vector
+static std::string passwd_vec_to_string_and_wipe(std::vector<byte>& v) {
+    std::string s(v.begin(), v.end());
+    sodium_memzero(v.data(), v.size());
+    v.clear();
+    return s;
+
 // -------- Logging (levels) --------
 enum class LogLevel { INFO, WARN, ERROR, ALERT }; // levels
 
