@@ -403,23 +403,40 @@ static bool save_meta(const byte salt[SALT_LEN], const byte nonce[NONCE_LEN]) {
 }
 
 // load vault ciphertext
-static bool load_vault_ciphertext(std::vector<unsigned char>& ct) {
+static bool load_vault_ciphertext(std::vector<byte>& ct) {
     FILE* f = fopen(VAULT_FILENAME, "rb");
     if (!f) return false;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        audit_log_level(LogLevel::ERROR, "fseek end failed");
+        return false;
+    }
     long sz = ftell(f);
-    if (sz < 0) { fclose(f); return false; }
+    if (sz < 0) {
+        fclose(f);
+        audit_log_level(LogLevel::ERROR, "ftell failed");
+        return false;
+    }
     if ((unsigned long)sz > MAX_VAULT_SIZE) {  // Prevent integer overflow & large files
-        std::cerr << "Vault file too large or corrupt.\n";
+        udit_log_level(LogLevel::WARN, "Vault file too large or corrupt.");
         fclose(f);
         return false;
     }
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        audit_log_level(LogLevel::ERROR, "fseek set failed");
+        return false;
+    }
     size_t size = static_cast<size_t>(sz);
     ct.resize(size);
     if (size > 0) {
         size_t r = fread(ct.data(), 1, size, f);
-        if (r != size) { fclose(f); ct.clear(); return false; }
+        if (r != size) {
+            fclose(f);
+            ct.clear();
+            audit_log_level(LogLevel::ERROR, "fread failed on vault");
+            return false;
+        }
     }
     fclose(f);
     return true;
