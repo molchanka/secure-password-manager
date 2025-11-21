@@ -1,6 +1,7 @@
 // passman.cpp
 // Build: g++ -std=c++17 -O2 -Wall passman.cpp -lsodium -o passman
 
+
 #include <sodium.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -20,6 +21,8 @@
 #include <iomanip>
 #include <cerrno>
 #include <limits>
+#include <algorithm>
+
 
 // -------- Configuration constants --------
 static constexpr const char* VAULT_FILENAME = "vault.bin";
@@ -78,6 +81,40 @@ static bool valid_password(const std::string& s) {
 }
 
 
+// -------- Logging (levels) --------
+enum class LogLevel { INFO, WARN, ERROR, ALERT }; // levels
+
+static void audit_log_level(LogLevel lvl, const std::string& entry) {
+    // append entry to audit log with 0600 perms
+    int fd = open(AUDIT_LOG, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        std::cerr << "open audit log failed" << strerror(errno) << "\n";
+        return;
+    }
+    time_t t = time(nullptr);
+    char buf[64];
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    const char* lname = "INFO";
+    switch (lvl) {
+        case LogLevel::INFO:  lname = "INFO"; break;
+        case LogLevel::WARN:  lname = "WARN"; break;
+        case LogLevel::ERROR: lname = "ERROR"; break;
+        case LogLevel::ALERT: lname = "ALERT"; break;
+    }
+    std::string line = std::string(buf) + " [" + lname + "] " + entry + "\n";
+    if (write(fd, line.c_str(), line.size()) < 0) {
+        std::cerr << "write audit log failed" << strerror(errno) << "\n";
+    }
+    if (close(fd) != 0) {
+        std::cerr << "close audit log failed" << strerror(errno) << "\n";
+    }
+}
+
+static void audit_log(const std::string& entry) { audit_log_level(LogLevel::INFO, entry); }
+
+
 // ---------- Secure input (returns vector<byte> so we can wipe reliably) ----------
 static std::vector<byte> get_password_bytes(const char* prompt) {
     std::vector<byte> rv;
@@ -122,40 +159,6 @@ static std::string passwd_vec_to_string_and_wipe(std::vector<byte>& v) {
 }
 
 
-// -------- Logging (levels) --------
-enum class LogLevel { INFO, WARN, ERROR, ALERT }; // levels
-
-static void audit_log_level(LogLevel lvl, const std::string& entry) {
-    // append entry to audit log with 0600 perms
-    int fd = open(AUDIT_LOG, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
-    if (fd < 0) {
-        std::cerr << "open audit log failed" << strerror(errno) << "\n";
-        return;
-    }
-    time_t t = time(nullptr);
-    char buf[64];
-    struct tm tm;
-    localtime_r(&t, &tm);
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
-    const char* lname = "INFO";
-    switch (lvl) {
-        case LogLevel::INFO:  lname = "INFO"; break;
-        case LogLevel::WARN:  lname = "WARN"; break;
-        case LogLevel::ERROR: lname = "ERROR"; break;
-        case LogLevel::ALERT: lname = "ALERT"; break;
-    }
-    std::string line = std::string(buf) + " [" + lname + "] " + entry + "\n";
-    if (write(fd, line.c_str(), line.size()) < 0) {
-        std::cerr << "write audit log failed" << strerror(errno) << "\n";
-    }
-    if (close(fd) != 0) {
-        std::cerr << "close audit log failed" << strerror(errno) << "\n";
-    }
-}
-
-static void audit_log(const std::string& entry) { audit_log_level(LogLevel::INFO, entry); }
-
-
 // zero and unlock memory safely
 static void secure_free(unsigned char* buf, size_t len) {
     if (!buf || len == 0) return;
@@ -178,7 +181,7 @@ static std::string get_password(const char* prompt) {
     if (!isatty(STDIN_FILENO)) {
         std::string tmp;
         if (!std::getline(std::cin, tmp)) return pw;
-        rv.assign(tmp.begin(), tmp.end());
+        pw.assign(tmp.begin(), tmp.end());
         return pw;
     }
     if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
@@ -198,7 +201,7 @@ static std::string get_password(const char* prompt) {
         audit_log_level(LogLevel::WARN, "tcsetattr failed while restoring attrs");
     }
     std::cout << "\n";
-    rv.assign(tmp.begin(), tmp.end());
+    pw.assign(tmp.begin(), tmp.end());
     return pw;
 }
 
@@ -248,7 +251,6 @@ static int cleanup_and_exit(int code, Vault& vault, unsigned char key[KEY_LEN],
     sodium_memzero(nonce, NONCE_LEN);
 
     audit_log_level(LogLevel::INFO, std::string("Session closed with code ") + std::to_string(code));
-    if (code != 0) std::cerr << "An unexpected error occurred. Check audit log for details.\n";
     return code;
 }
 
@@ -320,7 +322,7 @@ static Vault deserialize_vault(const std::string& s) {
 
 
 // -------- Crypto helpers --------
-static bool derive_key_from_password(const byte* pw, const byte salt[SALT_LEN], byte key[KEY_LEN]) {
+static bool derive_key_from_password(const byte* pw, size_t pw_len, const byte salt[SALT_LEN], byte key[KEY_LEN]) {
     if (!pw || pw_len == 0) return false;
     if (crypto_pwhash(key, KEY_LEN,
         reinterpret_cast<const char*>(pw), pw_len,
@@ -477,7 +479,7 @@ static bool load_meta(byte salt[SALT_LEN], byte nonce[NONCE_LEN]) {
         audit_log_level(LogLevel::WARN, "load_meta: meta decode length mismatch");
         return false;
     }
-    memcpy(salt, vb.data(), SALT_LEN);
+    memcpy(salt, vs.data(), SALT_LEN);
     memcpy(nonce, vn.data(), NONCE_LEN);
     return true;
 }
@@ -498,7 +500,7 @@ static bool load_vault_ciphertext(std::vector<byte>& ct) {
         return false;
     }
     if ((unsigned long)sz > MAX_VAULT_SIZE) {  // Prevent integer overflow & large files
-        udit_log_level(LogLevel::WARN, "Vault file too large or corrupt.");
+        audit_log_level(LogLevel::WARN, "Vault file too large or corrupt.");
         fclose(f);
         return false;
     }
@@ -592,8 +594,8 @@ int main() {
         std::cout << "No vault found. Initialize new vault.\n";
         // generate salt and ask master password twice
         randombytes_buf(salt, SALT_LEN);
-        std::vector<byte> pw1 = get_password("Create master password: ");
-        std::vector<byte> pw2 = get_password("Confirm master password: ");
+        std::vector<byte> pw1 = get_password_bytes("Create master password: ");
+        std::vector<byte> pw2 = get_password_bytes("Confirm master password: ");
         if (pw1 != pw2) {
             audit_log_level(LogLevel::WARN, "Vault init: passwords did not match");
             std::cerr << "Passwords do not match. Exiting.\n";
@@ -601,7 +603,7 @@ int main() {
             sodium_memzero(pw2.data(), pw2.size());
             return cleanup_and_exit(2, vault, key, salt, nonce);
         }
-        if (!derive_key_from_password(pw1.data(), pw1.size(), key)) {
+        if (!derive_key_from_password(pw1.data(), pw1.size(), salt, key)) {
             audit_log_level(LogLevel::ERROR, "Vault init: key derivation failed");
             sodium_memzero(pw1.data(), pw1.size());
             sodium_memzero(pw2.data(), pw2.size());
@@ -659,7 +661,7 @@ int main() {
 
     // Vault exists -> prompt for master password
     while (attempts < MAX_ATTEMPTS) {
-        std::vector<byte> master = get_password("Master password: ");
+        std::vector<byte> master = get_password_bytes("Master password: ");
         if (master.empty()) {
             attempts++;
             audit_log_level(LogLevel::WARN, "Empty master password input");
@@ -722,7 +724,7 @@ int main() {
             }
         }
         else if (choice == "2") { // ------ Add new credentials ------ 
-            std::string label, user, pass, notes;
+            std::string label, user, notes;
             std::cout << "+New - Label: ";
             std::getline(std::cin, label);
             if (!valid_label_or_username(label)) {
@@ -779,6 +781,9 @@ int main() {
                     audit_log_level(LogLevel::ERROR, "Failed to persist vault (add credential)");
                     std::cerr << "An unexpected error occurred. Check audit log.\n";
                 }
+                else {
+                    memcpy(nonce, new_nonce, NONCE_LEN);
+                }
                 sodium_memzero(ct, ct_len);
                 free(ct);
             }
@@ -793,7 +798,7 @@ int main() {
             if (it == vault.end()) { std::cout << "Not found\n"; continue; }
 
             // ask old password for that entry
-            std::vector<byte> oldpw_vec = get_password("Old password for this entry: ");
+            std::vector<byte> oldpw_vec = get_password_bytes("Old password for this entry: ");
             if (oldpw_vec.empty()) {
                 std::cout << "Invalid input\n";
                 continue;
@@ -814,8 +819,8 @@ int main() {
             }
             audit_log_level(LogLevel::INFO, "Update attempt for " + label);
 
-            std::vector<byte> newpw_vec = get_password("New password: ");
-            if (newpw.empty() || newpw.size() > MAX_PASS_LEN) {
+            std::vector<byte> newpw_vec = get_password_bytes("New password: ");
+            if (newpw_vec.empty() || newpw_vec.size() > MAX_PASS_LEN) {
                 std::cout << "Invalid new password\n";
                 sodium_memzero(oldpw_vec.data(), oldpw_vec.size()); oldpw_vec.clear();
                 sodium_memzero(newpw_vec.data(), newpw_vec.size()); newpw_vec.clear();
@@ -842,6 +847,9 @@ int main() {
                 if (!atomic_write_file(VAULT_FILENAME, ct, ct_len) || !save_meta(salt, new_nonce)) {
                     audit_log_level(LogLevel::ERROR, "Failed to persist vault (update)");
                     std::cerr << "An unexpected error occurred. Check audit log.\n";
+                }
+                else {
+                    memcpy(nonce, new_nonce, NONCE_LEN);
                 }
                 sodium_memzero(ct, ct_len);
                 free(ct);
@@ -901,6 +909,9 @@ int main() {
                     if (!atomic_write_file(VAULT_FILENAME, ct2, ct2_len) || !save_meta(salt, new_nonce)) {
                         audit_log_level(LogLevel::ERROR, "Failed to persist vault (delete credential)");
                         std::cerr << "An unexpected error occurred.\n";
+                    }
+                    else {
+                        memcpy(nonce, new_nonce, NONCE_LEN);
                     }
                     sodium_memzero(ct2, ct2_len); free(ct2);
                 }
@@ -983,7 +994,7 @@ int main() {
                 continue;
             }
 
-            std::vector<byte> masterCheck = get_password("Enter master password to confirm: ");
+            std::vector<byte> masterCheck = get_password_bytes("Enter master password to confirm: ");
             if (masterCheck.empty()) {
                 std::cout << "Invalid input\n";
                 continue;
