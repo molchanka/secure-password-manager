@@ -347,32 +347,59 @@ static bool atomic_write_file(const std::string& path, const byte* buf, size_t l
 }
 
 // load meta (salt & nonce) (meta file format: base64(salt)\nbase64(nonce)\n)
-static bool load_meta(unsigned char salt[SALT_LEN], unsigned char nonce[NONCE_LEN]) {
+static bool load_meta(byte salt[SALT_LEN], byte nonce[NONCE_LEN]) {
     FILE* f = fopen(META_FILENAME, "r");
-    if (!f) return false;
+    if (!f) {
+        audit_log_level(LogLevel::ERROR, "load_meta: fopen failed");
+        return false;
+    }
+
+    std::string s_salt, s_nonce;
     char buf[4096];
-    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return false; }
-    std::string s_salt(buf);
-    s_salt.erase(s_salt.find_last_not_of("\r\n") + 1);
-    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return false; }
-    std::string s_nonce(buf);
-    s_nonce.erase(s_nonce.find_last_not_of("\r\n") + 1);
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        audit_log_level(LogLevel::ERROR, "load_meta: fgets salt failed");
+        return false;
+    }
+    s_salt = buf;
+    while (!s_salt.empty() && (s_salt.back() == '\n' || s_salt.back() == '\r')) s_salt.pop_back();
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        audit_log_level(LogLevel::ERROR, "load_meta: fgets nonce failed");
+        return false;
+    }
+    s_nonce = buf;
+    while (!s_nonce.empty() && (s_nonce.back() == '\n' || s_nonce.back() == '\r')) s_nonce.pop_back();
+
     fclose(f);
-    auto vb = from_base64(s_salt);
-    if (vb.size() != SALT_LEN) return false;
-    memcpy(salt, vb.data(), SALT_LEN);
+
+    if (s_salt.empty() || s_nonce.empty()) {
+        audit_log_level(LogLevel::WARN, "load_meta: meta file missing lines");
+        return false;
+    }
+
+    auto vs = from_base64(s_salt);
     auto vn = from_base64(s_nonce);
-    if (vn.size() != NONCE_LEN) return false;
+    if (vn.size() != NONCE_LEN || vs.size() != SALT_LEN) {
+        audit_log_level(LogLevel::WARN, "load_meta: meta decode length mismatch");
+        return false;
+    }
+    memcpy(salt, vb.data(), SALT_LEN);
     memcpy(nonce, vn.data(), NONCE_LEN);
     return true;
 }
 
-static bool save_meta(const unsigned char salt[SALT_LEN], const unsigned char nonce[NONCE_LEN]) {
+static bool save_meta(const byte salt[SALT_LEN], const byte nonce[NONCE_LEN]) {
+    if (!salt || !nonce) return false;
     std::string b64salt = to_base64(salt, SALT_LEN);
     std::string b64nonce = to_base64(nonce, NONCE_LEN);
     std::string content = b64salt + "\n" + b64nonce + "\n";
     // atomic write
-    return atomic_write_file(META_FILENAME, (const unsigned char*)content.c_str(), content.size());
+    if (!atomic_write_file(META_FILENAME, reinterpret_cast<const byte*>(content.data()), content.size())) {
+        audit_log_level(LogLevel::ERROR, "save_meta: atomic write failed");
+        return false;
+    }
+    return true;
 }
 
 // load vault ciphertext
