@@ -6,7 +6,8 @@ Secure password manager for personal use, written using C++ and secured using va
 
 - Argon2id key derivation for master passwords
 - XChaCha20-Poly1305 authenticated encryption for all vault data
-- AEAD authentication (via Poly1305) provides integrity for all vault data.
+- AEAD authentication (via Poly1305) provides integrity for all vault data
+- Cross-platform clipboard integration (timed clear)
 
 
 ### Workflow
@@ -15,6 +16,7 @@ Secure password manager for personal use, written using C++ and secured using va
 - If incorrect -> failed attempt logged
 - After several failed attempts -> session locks
 - Vault automatically encrypted on every modification
+- Unicode-safe clipboard (CF_TEXT -> CF_UNICODETEXT)
 
 ### Credential operations
 
@@ -24,14 +26,14 @@ Secure password manager for personal use, written using C++ and secured using va
 | Update | Requires old password, validates, securely overwrites, creates a log entry |
 | Delete | Requires master password, removes the credential, creates a log entry |
 | Reveal | Displays credential, creates a log entry |
-| Copy | Copies credential into a secure buffer (not system clipboard), buffer is locked in RAM and wiped on demand |
+| Copy | Copies credential into a secure buffer that is locked in RAM and wiped on demand or to system clipboard with necessary warnings |
 
 ### Future roadmap
 
 - SHA-256 for log integrity checks
-- Cross-platform clipboard integration (timed clear)
 - Session timeout auto-lock
 - Multi-vault support
+- Testing on native Windows
 
 ## Dependencies
 
