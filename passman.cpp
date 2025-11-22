@@ -8,6 +8,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
+#if defined(_WIN32)
+    #include <windows.h>
+#else
+    #include <sys/wait.h>
+    #include <spawn.h>
+    extern char** environ;
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +29,11 @@
 #include <cerrno>
 #include <limits>
 #include <algorithm>
+#include <thread>
+#include <chrono>
+#include <atomic>
+
+
 
 
 // -------- Configuration constants --------
@@ -232,6 +244,254 @@ static std::vector<byte> from_base64(const std::string& b64) {
     if (out_len > out.size()) return {}; // sanity guard (no malformed base64 strings)
     out.resize(out_len);
     return out;
+}
+
+
+// ---------------- Cross-platform clipboard helpers ----------------
+static bool run_writer_with_stdin(const std::vector<const char*>& argv, const std::string& input) {
+#if defined(_WIN32)
+    (void)argv; (void)input;
+    return false; // Will not be used on Windows.
+#else
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return false;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]); close(pipefd[1]);
+        return false;
+    }
+    if (pid == 0) {
+        // child: replace stdin with read end
+        dup2(pipefd[0], STDIN_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+
+        // build argv for exec
+        std::vector<char*> args;
+        for (auto p : argv) args.push_back(const_cast<char*>(p));
+        args.push_back(nullptr);
+        // execvp is safe here because argv[0] is a literal from code or user-checked path
+        execvp(args[0], args.data());
+        _exit(127); // exec failed
+    }
+    // parent: write then close write-end
+    close(pipefd[0]);
+    ssize_t to_write = (ssize_t)input.size();
+    const char* buf = input.data();
+    while (to_write > 0) {
+        ssize_t w = write(pipefd[1], buf, to_write);
+        if (w <= 0) break;
+        buf += w;
+        to_write -= w;
+    }
+    close(pipefd[1]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
+}
+
+static bool run_reader_to_string(const std::vector<const char*>& argv, std::string& out) {
+#if defined(_WIN32)
+    (void)argv; (void)out;
+    return false;
+#else
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return false;
+
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return false; }
+    if (pid == 0) {
+        // child: replace stdout with write end
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[0]); close(pipefd[1]);
+        std::vector<char*> args;
+        for (auto p : argv) args.push_back(const_cast<char*>(p));
+        args.push_back(nullptr);
+        execvp(args[0], args.data());
+        _exit(127);
+    }
+    // parent: read
+    close(pipefd[1]);
+    std::string s;
+    char buf[4096];
+    ssize_t r;
+    while ((r = read(pipefd[0], buf, sizeof(buf))) > 0) {
+        s.append(buf, buf + r);
+        if (s.size() > 1024 * 1024) break; // avoid insane size
+    }
+    close(pipefd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return false;
+    // trim trailing newlines
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    out.swap(s);
+    return true;
+#endif
+}
+
+#if defined(_WIN32)
+
+// Windows implementation
+static bool clipboard_set_win(const std::string& data) {
+    if (!OpenClipboard(nullptr)) return false;
+    if (!EmptyClipboard()) { CloseClipboard(); return false; }
+    SIZE_T lenBytes = (data.size() + 1);
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, lenBytes);
+    if (!h) { CloseClipboard(); return false; }
+    void* p = GlobalLock(h);
+    if (!p) { GlobalFree(h); CloseClipboard(); return false; }
+    memcpy(p, data.data(), data.size());
+    // Ensure trailing NUL
+    ((char*)p)[data.size()] = '\0';
+    GlobalUnlock(h);
+    if (!SetClipboardData(CF_TEXT, h)) {
+        GlobalFree(h);
+        CloseClipboard();
+        return false;
+    }
+    // Do not free h after SetClipboardData successful (system owns it).
+    CloseClipboard();
+    return true;
+}
+
+static bool clipboard_get_win(std::string& out) {
+    out.clear();
+    if (!OpenClipboard(nullptr)) return false;
+    HANDLE h = GetClipboardData(CF_TEXT);
+    if (!h) { CloseClipboard(); return false; }
+    char* p = static_cast<char*>(GlobalLock(h));
+    if (!p) { CloseClipboard(); return false; }
+    out.assign(p);
+    GlobalUnlock(h);
+    CloseClipboard();
+    return true;
+}
+
+static bool clipboard_clear_win() {
+    if (!OpenClipboard(nullptr)) return false;
+    bool ok = EmptyClipboard();
+    CloseClipboard();
+    return ok;
+}
+
+#endif
+
+// POSIX helpers: try several available clipboard utilities
+static bool clipboard_set_posix(const std::string& data) {
+    // prefer wl-copy (Wayland), then pbcopy (macOS), then xclip/xsel
+    const std::vector<std::vector<const char*>> writers = {
+        { "wl-copy", "--no-newline" },      // wl-copy doesn't add newline if we pass option
+        { "pbcopy" },                       // macOS
+        { "xclip", "-selection", "clipboard" },
+        { "xsel", "--clipboard", "--input" }
+    };
+    for (const auto& a : writers) {
+        if (access(a[0], X_OK) == 0) {
+            if (run_writer_with_stdin(a, data)) return true;
+        }
+    }
+    return false;
+}
+
+static bool clipboard_get_posix(std::string& out) {
+    const std::vector<std::vector<const char*>> readers = {
+        { "wl-paste", "--no-newline" },
+        { "pbpaste" },
+        { "xclip", "-selection", "clipboard", "-o" },
+        { "xsel", "--clipboard", "--output" }
+    };
+    for (const auto& a : readers) {
+        if (access(a[0], X_OK) == 0) {
+            if (run_reader_to_string(a, out)) return true;
+        }
+    }
+    return false;
+}
+
+static bool clipboard_clear_posix() {
+    // Clearing: set empty string
+    return clipboard_set_posix(std::string());
+}
+
+// High-level small wrappers:
+static bool clipboard_set(const std::string& data) {
+#if defined(_WIN32)
+    return clipboard_set_win(data);
+#else
+    return clipboard_set_posix(data);
+#endif
+}
+
+static bool clipboard_get(std::string& out) {
+#if defined(_WIN32)
+    return clipboard_get_win(out);
+#else
+    return clipboard_get_posix(out);
+#endif
+}
+
+static bool clipboard_clear() {
+#if defined(_WIN32)
+    return clipboard_clear_win();
+#else
+    return clipboard_clear_posix();
+#endif
+}
+
+// copy with timed clear: copies data to clipboard and clears after `seconds` only if the
+// clipboard still contains identical content. zeroes local buffers used.
+static void copy_with_timed_clear(const std::string& secret, unsigned seconds) {
+    if (secret.empty()) return;
+
+    // Copy using a controlled buffer so we can wipe it after use
+    std::vector<unsigned char> buf(secret.begin(), secret.end());
+    // Attempt to set clipboard
+    bool ok = false;
+#if defined(_WIN32)
+    // Win32 path: create a std::string for API call
+    std::string tmp((char*)buf.data(), buf.size());
+    ok = clipboard_set(tmp);
+    sodium_memzero((void*)tmp.data(), tmp.size());
+#else
+    std::string tmp((char*)buf.data(), buf.size());
+    ok = clipboard_set(tmp);
+    sodium_memzero((void*)tmp.data(), tmp.size());
+#endif
+
+    // Wipe our local vector copy
+    sodium_memzero(buf.data(), buf.size());
+    buf.clear();
+
+    if (!ok) {
+        audit_log_level(LogLevel::WARN, "clipboard_set failed for timed copy");
+        return;
+    }
+
+    // Spawn a detached thread to clear clipboard after timeout.
+    // The thread will re-read the clipboard and only clear if contents match what we put there.
+    std::thread([secret, seconds]() {
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        std::string current;
+        if (!clipboard_get(current)) {
+            // maybe already cleared or cannot read; nothing to do
+            return;
+        }
+        // Trim trailing newline differences
+        std::string expected = secret;
+        // Compare exactly; if matches, clear
+        if (current == expected) {
+            clipboard_clear();
+            audit_log_level(LogLevel::INFO, "Clipboard cleared after timeout");
+        }
+        // wipe current
+        if (!current.empty()) {
+            sodium_memzero(&current[0], current.size());
+        }
+        }).detach();
 }
 
 
