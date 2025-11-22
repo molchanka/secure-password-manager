@@ -1,4 +1,4 @@
-// passman.cpp
+﻿// passman.cpp
 // Build: g++ -std=c++17 -O2 -Wall passman.cpp -lsodium -o passman
 
 
@@ -32,6 +32,7 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <cctype>
 
 
 
@@ -391,7 +392,7 @@ static bool windows_clipboard_history_enabled() {
         KEY_READ,
         &hKey) != ERROR_SUCCESS)
     {
-        return false; // key missing ? treat as disabled
+        return false; // key missing → treat as disabled
     }
 
     LONG result = RegQueryValueExA(
@@ -410,9 +411,6 @@ static bool windows_clipboard_history_enabled() {
 
     return (value == 1);
 }
-#endif
-
-
 #endif
 // ----------------
 
@@ -435,16 +433,22 @@ static bool wsl_clipboard_history_enabled() {
     return (out == "1");
 }
 
+
 static bool running_in_wsl() {
-    // Only Linux uses /proc
     FILE* f = fopen("/proc/version", "r");
     if (!f) return false;
 
-    char buf[256] = { 0 };
-    fread(buf, 1, sizeof(buf) - 1, f);
+    char buf[256];
+    size_t nread = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
 
-    // WSL identifies itself in /proc/version
+    if (nread == 0) {
+        // Could not read; assume not WSL.
+        return false;
+    }
+
+    buf[nread] = '\0';  // explicit NUL-termination
+
     return (strstr(buf, "Microsoft") || strstr(buf, "WSL"));
 }
 // ----------------
@@ -1373,7 +1377,7 @@ int main() {
 
                 // Copy with timed clear
                 copy_with_timed_clear(it->second.password, timeout_secs);
-                audit_log_level(LogLevel::INFO, "Copy requested for " + label + " -> system clipboard (timed for " + timeout_secs + ")");
+                audit_log_level(LogLevel::INFO, "Copy requested for " + label + " -> system clipboard (timed for " + std::to_string(timeout_secs) + ")");
                 std::cout << "Password copied to system clipboard for " << timeout_secs << " seconds. Action logged.\n";
             }
             else {
