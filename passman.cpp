@@ -394,10 +394,19 @@ static bool clipboard_set_posix(const std::string& data) {
             if (run_writer_with_stdin(a, data)) return true;
         }
     }
+
+    // WSL integration
+    const char* winclip = "/mnt/c/Windows/System32/clip.exe";
+    const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+    if (access(winclip, X_OK) == 0 && access(pwsh, X_OK) == 0) {
+        std::vector<const char*> args = { winclip };
+        return run_writer_with_stdin(args, data);
+    }
     return false;
 }
 
 static bool clipboard_get_posix(std::string& out) {
+
     const std::vector<std::vector<const char*>> readers = {
         { "wl-paste", "--no-newline" },
         { "pbpaste" },
@@ -409,12 +418,31 @@ static bool clipboard_get_posix(std::string& out) {
             if (run_reader_to_string(a, out)) return true;
         }
     }
+
+    // WSL integration
+    const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+    if (access(pwsh, X_OK) == 0) {
+        std::vector<const char*> args = {
+            pwsh,
+            "-NoProfile",
+            "-Command",
+            "Get-Clipboard"
+        };
+        return run_reader_to_string(args, out);
+    }
     return false;
 }
 
 static bool clipboard_clear_posix() {
     // Clearing: set empty string
     return clipboard_set_posix(std::string());
+
+    // WSL: clear Windows clipboard via clip.exe
+    const char* winclip = "/mnt/c/Windows/System32/clip.exe";
+    if (access(winclip, X_OK) == 0) {
+        std::vector<const char*> args = { winclip };
+        return run_writer_with_stdin(args, "");
+    }
 }
 
 // High-level small wrappers:
@@ -1208,37 +1236,62 @@ int main() {
             }
             audit_log_level(LogLevel::INFO, "Copy requested for " + label);
 
-            // Secure buffer allocation (mlock)
-            size_t len = it->second.password.size();
-            if (len == 0 || len > MAX_PASS_LEN) {
-                std::cout << "Password invalid size\n";
-                continue;
-            }
-            byte* buf = (byte*)malloc(len + 1);
-            if (!buf) {
-                std::cout << "Alloc fail\n";
-                continue;
-            }
-            memcpy(buf, it->second.password.data(), len);
-            buf[len] = 0;
+            std::cout << "Copy to: (1) secure internal buffer (current behavior)  (2) system clipboard (timed clear)\n";
+            std::cout << "Choose 1 or 2: ";
+            std::string opt; std::getline(std::cin, opt);
+
+            if (opt == "1") {
+                // Secure buffer allocation (mlock)
+                size_t len = it->second.password.size();
+                if (len == 0 || len > MAX_PASS_LEN) {
+                    std::cout << "Password invalid size\n";
+                    continue;
+                }
+                byte* buf = (byte*)malloc(len + 1);
+                if (!buf) {
+                    std::cout << "Alloc fail\n";
+                    continue;
+                }
+                memcpy(buf, it->second.password.data(), len);
+                buf[len] = 0;
 
 #if defined(MADV_DONTNEED)
-            if (mlock(buf, len + 1) != 0) {
-                audit_log_level(LogLevel::WARN, "mlock failed for secure buffer");
-            }
+                if (mlock(buf, len + 1) != 0) {
+                    audit_log_level(LogLevel::WARN, "mlock failed for secure buffer");
+                }
 #endif
 
-            std::cout << "Password copied to secure buffer (NOT system clipboard). Press Enter to clear it now.\n";
-            audit_log_level(LogLevel::INFO, "Credential copied to secure buffer for " + label);
-            std::string dummy;
-            std::getline(std::cin, dummy);
-            // clear buffer
-            sodium_memzero(buf, len + 1);
+                std::cout << "Password copied to secure buffer (NOT system clipboard). Press Enter to clear it now.\n";
+                audit_log_level(LogLevel::INFO, "Credential copied to secure buffer for " + label);
+                std::string dummy;
+                std::getline(std::cin, dummy);
+                // clear buffer
+                sodium_memzero(buf, len + 1);
 #if defined(MADV_DONTNEED)
-            munlock(buf, len + 1);
+                munlock(buf, len + 1);
 #endif
-            free(buf);
-            audit_log_level(LogLevel::INFO, "Secure buffer cleared for " + label);
+                free(buf);
+                audit_log_level(LogLevel::INFO, "Secure buffer cleared for " + label);
+            }
+            else if (opt == "2") {
+                // system clipboard flow
+                unsigned timeout_secs = 15; // default
+                std::cout << "Timeout seconds (default 15): ";
+                std::string ts; std::getline(std::cin, ts);
+                if (!ts.empty()) {
+                    try { timeout_secs = std::stoul(ts); }
+                    catch (...) { timeout_secs = 15; }
+                    if (timeout_secs > 600) timeout_secs = 600; // cap
+                }
+
+                // Copy with timed clear
+                audit_log_level(LogLevel::INFO, "Copy requested for " + label + " -> system clipboard (timed)");
+                copy_with_timed_clear(it->second.password, timeout_secs);
+                std::cout << "Password copied to system clipboard for " << timeout_secs << " seconds. Action logged.\n";
+            }
+            else {
+                std::cout << "Invalid option\n";
+            }
         }
         else if (choice == "7") { // ------ Exit the password manager ------ 
             running = false;

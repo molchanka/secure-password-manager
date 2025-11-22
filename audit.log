@@ -1,0 +1,27 @@
+2025-11-22 08:48:46 [INFO] New vault initialized
+2025-11-22 08:48:50 [INFO] Master password accepted - session opened
+2025-11-22 08:48:50 [INFO] Master password accepted - session opened
+2025-11-22 08:49:06 [INFO] Add credential: 2
+2025-11-22 08:49:16 [INFO] Reveal password requested for 2
+2025-11-22 08:49:25 [INFO] Copy requested for 2
+2025-11-22 08:50:18 [INFO] Copy requested for 2 -> system clipboard (timed)
+2025-11-22 08:50:18 [WARN] clipboard_set failed for timed copy
+2025-11-22 08:50:33 [INFO] Copy requested for 2
+2025-11-22 08:50:39 [INFO] Copy requested for 2 -> system clipboard (timed)
+2025-11-22 08:50:39 [WARN] clipboard_set failed for timed copy
+2025-11-22 08:51:10 [INFO] Copy requested for 2
+2025-11-22 08:51:16 [INFO] Copy requested for 2 -> system clipboard (timed)
+2025-11-22 08:51:16 [WARN] clipboard_set failed for timed copy
+2025-11-22 08:54:02 [INFO] Session closed
+2025-11-22 08:54:02 [INFO] Session closed with code 0
+2025-11-22 08:54:15 [INFO] Master password accepted - session opened
+2025-11-22 08:54:15 [INFO] Master password accepted - session opened
+2025-11-22 08:54:22 [INFO] Copy requested for 2
+2025-11-22 08:54:27 [INFO] Copy requested for 2 -> system clipboard (timed)
+2025-11-22 09:00:01 [INFO] Session closed
+2025-11-22 09:00:01 [INFO] Session closed with code 0
+2025-11-22 09:03:42 [INFO] Master password accepted - session opened
+2025-11-22 09:03:42 [INFO] Master password accepted - session opened
+2025-11-22 09:03:54 [INFO] Copy requested for 2
+2025-11-22 09:03:57 [INFO] Copy requested for 2 -> system clipboard (timed)
+2025-11-22 09:04:08 [INFO] Clipboard cleared after timeout
