@@ -333,9 +333,9 @@ static bool run_reader_to_string(const std::vector<const char*>& argv, std::stri
 #endif
 }
 
-#if defined(_WIN32)
 
-// Windows implementation
+// Windows section ---------------
+#if defined(_WIN32)
 static bool clipboard_set_win(const std::string& data) {
     if (!OpenClipboard(nullptr)) return false;
     if (!EmptyClipboard()) { CloseClipboard(); return false; }
@@ -378,7 +378,76 @@ static bool clipboard_clear_win() {
     return ok;
 }
 
+static bool windows_clipboard_history_enabled() {
+    HKEY hKey;
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+
+    // HKCU\Software\Microsoft\Clipboard\EnableClipboardHistory
+    if (RegOpenKeyExA(
+        HKEY_CURRENT_USER,
+        "Software\\Microsoft\\Clipboard",
+        0,
+        KEY_READ,
+        &hKey) != ERROR_SUCCESS)
+    {
+        return false; // key missing ? treat as disabled
+    }
+
+    LONG result = RegQueryValueExA(
+        hKey,
+        "EnableClipboardHistory",
+        NULL,
+        NULL,
+        (LPBYTE)&value,
+        &size
+    );
+    RegCloseKey(hKey);
+
+    if (result != ERROR_SUCCESS) {
+        return false;
+    }
+
+    return (value == 1);
+}
 #endif
+
+
+#endif
+// ----------------
+
+// WSL section ---------------
+static bool wsl_clipboard_history_enabled() {
+    const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+    if (access(pwsh, X_OK) != 0) return false; // not WSL or no pwsh
+
+    std::vector<const char*> args = {
+        pwsh,
+        "-NoProfile",
+        "-Command",
+        "(Get-ItemProperty HKCU:\\Software\\Microsoft\\Clipboard).EnableClipboardHistory"
+    };
+
+    std::string out;
+    if (!run_reader_to_string(args, out)) return false;
+
+    // PowerShell outputs e.g. "1" or "0" or empty
+    return (out == "1");
+}
+
+static bool running_in_wsl() {
+    // Only Linux uses /proc
+    FILE* f = fopen("/proc/version", "r");
+    if (!f) return false;
+
+    char buf[256] = { 0 };
+    fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+
+    // WSL identifies itself in /proc/version
+    return (strstr(buf, "Microsoft") || strstr(buf, "WSL"));
+}
+// ----------------
 
 // POSIX helpers: try several available clipboard utilities
 static bool clipboard_set_posix(const std::string& data) {
@@ -394,13 +463,14 @@ static bool clipboard_set_posix(const std::string& data) {
             if (run_writer_with_stdin(a, data)) return true;
         }
     }
-
     // WSL integration
-    const char* winclip = "/mnt/c/Windows/System32/clip.exe";
-    const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
-    if (access(winclip, X_OK) == 0 && access(pwsh, X_OK) == 0) {
-        std::vector<const char*> args = { winclip };
-        return run_writer_with_stdin(args, data);
+    if (running_in_wsl()) {
+        const char* winclip = "/mnt/c/Windows/System32/clip.exe";
+        const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+        if (access(winclip, X_OK) == 0 && access(pwsh, X_OK) == 0) {
+            std::vector<const char*> args = { winclip };
+            return run_writer_with_stdin(args, data);
+        }
     }
     return false;
 }
@@ -420,15 +490,17 @@ static bool clipboard_get_posix(std::string& out) {
     }
 
     // WSL integration
-    const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
-    if (access(pwsh, X_OK) == 0) {
-        std::vector<const char*> args = {
-            pwsh,
-            "-NoProfile",
-            "-Command",
-            "Get-Clipboard"
-        };
-        return run_reader_to_string(args, out);
+    if (running_in_wsl()) {
+        const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+        if (access(pwsh, X_OK) == 0) {
+            std::vector<const char*> args = {
+                pwsh,
+                "-NoProfile",
+                "-Command",
+                "Get-Clipboard"
+            };
+            return run_reader_to_string(args, out);
+        }
     }
     return false;
 }
@@ -438,10 +510,12 @@ static bool clipboard_clear_posix() {
     return clipboard_set_posix(std::string());
 
     // WSL: clear Windows clipboard via clip.exe
-    const char* winclip = "/mnt/c/Windows/System32/clip.exe";
-    if (access(winclip, X_OK) == 0) {
-        std::vector<const char*> args = { winclip };
-        return run_writer_with_stdin(args, "");
+    if (running_in_wsl()) {
+        const char* winclip = "/mnt/c/Windows/System32/clip.exe";
+        if (access(winclip, X_OK) == 0) {
+            std::vector<const char*> args = { winclip };
+            return run_writer_with_stdin(args, "");
+        }
     }
 }
 
@@ -1274,6 +1348,19 @@ int main() {
                 audit_log_level(LogLevel::INFO, "Secure buffer cleared for " + label);
             }
             else if (opt == "2") {
+#if defined(_WIN32)
+                if (windows_clipboard_history_enabled()) {
+                    std::cout << "WARNING: Windows Clipboard History is enabled.\n";
+                    std::cout << "Passwords you copy may remain visible in Win+V history.\n";
+                }
+#else
+                if (running_in_wsl()) {
+                    if (wsl_clipboard_history_enabled()) {
+                        std::cout << "WARNING: Windows Clipboard History is enabled.\n";
+                        std::cout << "Passwords you copy may remain visible in Win+V history.\n";
+                    }
+                }
+#endif
                 // system clipboard flow
                 unsigned timeout_secs = 15; // default
                 std::cout << "Timeout seconds (default 15): ";
@@ -1285,8 +1372,8 @@ int main() {
                 }
 
                 // Copy with timed clear
-                audit_log_level(LogLevel::INFO, "Copy requested for " + label + " -> system clipboard (timed)");
                 copy_with_timed_clear(it->second.password, timeout_secs);
+                audit_log_level(LogLevel::INFO, "Copy requested for " + label + " -> system clipboard (timed for " + timeout_secs + ")");
                 std::cout << "Password copied to system clipboard for " << timeout_secs << " seconds. Action logged.\n";
             }
             else {
