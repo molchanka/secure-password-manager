@@ -68,6 +68,25 @@ struct Cred {
 using Vault = std::map<std::string, Cred>; // key by label
 
 
+// ---------- SessionID ---------- 
+
+static std::string generate_session_id() {
+    unsigned char buf[16];
+    std::random_device rd;
+    for (std::size_t i = 0; i < sizeof(buf); ++i) {
+        buf[i] = static_cast<unsigned char>(rd());
+    }
+    static const char* hex = "0123456789abcdef";
+    char out[33];
+    out[32] = '\0';
+    for (std::size_t i = 0; i < sizeof(buf); ++i) {
+        out[2 * i] = hex[(buf[i] >> 4) & 0x0F];
+        out[2 * i + 1] = hex[buf[i] & 0x0F];
+    }
+    return std::string(out);
+}
+
+
 // ---------- Helpers: input validation ----------
 static bool contains_control_or_tab_or_null(const std::string& s) {
     for (unsigned char c : s) {
@@ -97,6 +116,72 @@ static bool valid_password(const std::string& s) {
 // -------- Logging (levels) --------
 enum class LogLevel { INFO, WARN, ERROR, ALERT }; // levels
 
+struct LogContext {
+    std::string userId;
+    std::string sessionId;
+    std::string ip;
+};
+
+static LogContext g_log_ctx;
+
+static std::string get_system_username() {
+#if defined(_WIN32)
+    char buf[256];
+    DWORD len = static_cast<DWORD>(sizeof(buf));
+    if (GetUserNameA(buf, &len)) {
+        return std::string(buf);
+    }
+    const char* envUser = std::getenv("USERNAME");
+    if (envUser && *envUser) {
+        return std::string(envUser);
+    }
+    return "unknown";
+#else
+    // Use effective UID to handle sudo / different users correctly
+    uid_t uid = geteuid();
+    struct passwd* pw = getpwuid(uid);
+    if (pw && pw->pw_name) {
+        return std::string(pw->pw_name);
+    }
+    const char* envUser = std::getenv("USER");
+    if (envUser && *envUser) {
+        return std::string(envUser);
+    }
+    return "unknown";
+#endif
+}
+
+// Detect client IP based on SSH env, else fallback to localhost
+static std::string get_client_ip() {
+    const char* ssh_conn = std::getenv("SSH_CONNECTION");
+    if (ssh_conn && ssh_conn[0]) {
+        // SSH_CONNECTION="client_ip client_port server_ip server_port"
+        std::istringstream iss(ssh_conn);
+        std::string ip;
+        if (iss >> ip) {
+            return ip;
+        }
+    }
+    const char* ssh_client = std::getenv("SSH_CLIENT");
+    if (ssh_client && ssh_client[0]) {
+        // SSH_CLIENT="client_ip client_port local_port"
+        std::istringstream iss(ssh_client);
+        std::string ip;
+        if (iss >> ip) {
+            return ip;
+        }
+    }
+    // Local execution (no SSH)
+    return "127.0.0.1";
+}
+
+// Initialize global logging context (userId, sessionId, IP)
+static void init_log_context() {
+    g_log_ctx.userId = get_system_username();
+    g_log_ctx.sessionId = generate_session_id();
+    g_log_ctx.ip = get_client_ip();
+}
+
 static void audit_log_level(LogLevel lvl, const std::string& entry) {
     // append entry to audit log with 0600 perms
     int fd = open(AUDIT_LOG, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
@@ -104,18 +189,46 @@ static void audit_log_level(LogLevel lvl, const std::string& entry) {
         std::cerr << "open audit log failed" << strerror(errno) << "\n";
         return;
     }
+
     time_t t = time(nullptr);
     char buf[64];
     struct tm tm;
     localtime_r(&t, &tm);
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+
+
     const char* lname = "INFO";
+    std::string event = "info";
+    std::string outcome = "success";
+
     switch (lvl) {
-        case LogLevel::INFO:  lname = "INFO"; break;
-        case LogLevel::WARN:  lname = "WARN"; break;
-        case LogLevel::ERROR: lname = "ERROR"; break;
-        case LogLevel::ALERT: lname = "ALERT"; break;
+        case LogLevel::INFO:
+            lname = "INFO";
+            event = "info";
+            outcome = "success";
+            break;
+        case LogLevel::WARN:
+            lname = "WARN";
+            event = "warning";
+            outcome = "warning";
+            break;
+        case LogLevel::ERROR:
+            lname = "ERROR";
+            event = "error";
+            outcome = "failure";
+            break;
+        case LogLevel::ALERT:
+            lname = "ALERT";
+            event = "alert";
+            outcome = "critical";
+            break;
     }
+
+    if (!entry.empty()) {
+        oss << " detail=" << entry;
+    }
+    oss << "\n";
+
     std::string line = std::string(buf) + " [" + lname + "] " + entry + "\n";
     if (write(fd, line.c_str(), line.size()) < 0) {
         std::cerr << "write audit log failed" << strerror(errno) << "\n";
