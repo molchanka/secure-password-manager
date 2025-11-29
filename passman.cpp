@@ -1,4 +1,4 @@
-// passman.cpp
+﻿// passman.cpp
 // Build: g++ -std=c++17 -O2 -Wall passman.cpp -lsodium -o passman
 
 
@@ -8,6 +8,16 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
+#include <sys/types.h>
+#if defined(_WIN32)
+    #include <windows.h>
+#else
+    #include <sys/wait.h>
+    #include <spawn.h>
+    extern char** environ;
+    #include <pwd.h>
+    #include <dirent.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +32,13 @@
 #include <cerrno>
 #include <limits>
 #include <algorithm>
+#include <thread>
+#include <chrono>
+#include <atomic>
+#include <cctype>
+#include <random>
+
+
 
 
 // -------- Configuration constants --------
@@ -41,6 +58,8 @@ static constexpr size_t MEMLIMIT = crypto_pwhash_MEMLIMIT_MODERATE;
 static constexpr size_t MAX_USER_LEN = 256;
 static constexpr size_t MAX_PASS_LEN = 1024;
 static constexpr size_t MAX_LABEL_LEN = 256;
+static constexpr size_t MAX_VAULT_NAME_LEN = 64;
+static constexpr size_t MAX_NOTES_LEN = 4096;
 static constexpr size_t MAX_VAULT_SIZE = 10 * 1024 * 1024; // 10 MB hard cap
 
 using byte = unsigned char;
@@ -53,6 +72,33 @@ struct Cred {
 };
 
 using Vault = std::map<std::string, Cred>; // key by label
+
+
+// ---------- SessionID ---------- 
+static std::string generate_session_id() {
+    unsigned char buf[16];
+    std::random_device rd;
+    for (std::size_t i = 0; i < sizeof(buf); ++i) {
+        buf[i] = static_cast<unsigned char>(rd());
+    }
+    static const char* hex = "0123456789abcdef";
+    char out[33];
+    out[32] = '\0';
+    for (std::size_t i = 0; i < sizeof(buf); ++i) {
+        out[2 * i] = hex[(buf[i] >> 4) & 0x0F];
+        out[2 * i + 1] = hex[buf[i] & 0x0F];
+    }
+    return std::string(out);
+}
+
+
+// -------- Global vault paths --------
+static std::string g_vault_root;       // e.g. /home/user/.securepass/vaults
+static std::string g_vault_dir;        // e.g. /home/user/.securepass/vaults/default
+static std::string g_vault_name;       // e.g. "default"
+static std::string g_vault_filename;   // g_vault_dir + "/vault.bin"
+static std::string g_meta_filename;    // g_vault_dir + "/vault.meta"
+static std::string g_audit_log_path;   // g_vault_dir + "/audit.log"
 
 
 // ---------- Helpers: input validation ----------
@@ -80,22 +126,159 @@ static bool valid_password(const std::string& s) {
     return true;
 }
 
+static bool valid_vault_name(const std::string& v) {
+    if (v.empty()) return false;
+    if (v.size() > MAX_VAULT_NAME_LEN) return false;
+    for (unsigned char c : v) {
+        if (!(std::isalnum(c) || c == '_' || c == '-')) { // allow alnum, '_', '-'
+            return false;
+        }
+    }
+    return true;
+}
+
+
+// ---------- Vault name and path helpers ----------
+static std::string get_user_home_dir() {
+#if defined(_WIN32)
+    const char* home = std::getenv("USERPROFILE");
+    if (!home || !*home) {
+        home = std::getenv("HOMEPATH");
+    }
+    if (!home || !*home) {
+        return ".";
+    }
+    return std::string(home);
+#else
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) {
+        struct passwd* pw = getpwuid(geteuid());
+        if (pw && pw->pw_dir) {
+            home = pw->pw_dir;
+        }
+    }
+    if (!home || !*home) return ".";
+    return std::string(home);
+#endif
+}
+
+static bool ensure_dir_exists(const std::string & path, mode_t mode) {
+#if defined(_WIN32)
+    if (_mkdir(path.c_str()) != 0 && errno != EEXIST) {
+        std::cerr << "Failed to create directory " << path << ": " << strerror(errno) << "\n";
+        return false;
+    }
+    return true;
+#else
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            std::cerr << path << " exists but is not a directory\n";
+            return false;
+        }
+        if ((st.st_mode & 0777) != mode) {
+            chmod(path.c_str(), mode);
+        }
+        return true;
+    }
+    if (mkdir(path.c_str(), mode) != 0) {
+        if (errno != EEXIST) {
+            std::cerr << "Failed to create directory " << path << ": " << strerror(errno) << "\n";
+            return false;
+        }
+    }
+    return true;
+#endif
+}
+
 
 // -------- Logging (levels) --------
 enum class LogLevel { INFO, WARN, ERROR, ALERT }; // levels
 
-static void audit_log_level(LogLevel lvl, const std::string& entry) {
-    // append entry to audit log with 0600 perms
-    int fd = open(AUDIT_LOG, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
+struct LogContext {
+    std::string userId;
+    std::string sessionId;
+    std::string ip;
+};
+
+static LogContext g_log_ctx;
+
+static std::string get_system_username() {
+#if defined(_WIN32)
+    char buf[256];
+    DWORD len = static_cast<DWORD>(sizeof(buf));
+    if (GetUserNameA(buf, &len)) {
+        return std::string(buf);
+    }
+    const char* envUser = std::getenv("USERNAME");
+    if (envUser && *envUser) {
+        return std::string(envUser);
+    }
+    return "unknown";
+#else
+    // Use effective UID to handle sudo / different users correctly
+    uid_t uid = geteuid();
+    struct passwd* pw = getpwuid(uid);
+    if (pw && pw->pw_name) {
+        return std::string(pw->pw_name);
+    }
+    const char* envUser = std::getenv("USER");
+    if (envUser && *envUser) {
+        return std::string(envUser);
+    }
+    return "unknown";
+#endif
+}
+
+// Detect client IP based on SSH env, else fallback to localhost
+static std::string get_client_ip() {
+    const char* ssh_conn = std::getenv("SSH_CONNECTION");
+    if (ssh_conn && ssh_conn[0]) {
+        // SSH_CONNECTION="client_ip client_port server_ip server_port"
+        std::istringstream iss(ssh_conn);
+        std::string ip;
+        if (iss >> ip) {
+            return ip;
+        }
+    }
+    const char* ssh_client = std::getenv("SSH_CLIENT");
+    if (ssh_client && ssh_client[0]) {
+        // SSH_CLIENT="client_ip client_port local_port"
+        std::istringstream iss(ssh_client);
+        std::string ip;
+        if (iss >> ip) {
+            return ip;
+        }
+    }
+    // Local execution (no SSH)
+    return "127.0.0.1";
+}
+
+// Initialize global logging context (userId, sessionId, IP)
+static void init_log_context() {
+    g_log_ctx.userId = get_system_username();
+    g_log_ctx.sessionId = generate_session_id();
+    g_log_ctx.ip = get_client_ip();
+}
+
+static void audit_log_level(LogLevel lvl, const std::string& entry, const std::string& event = "", const std::string& outcome = "") {
+    //int fd = open(AUDIT_LOG, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    const char* path = nullptr;
+    static const char* default_log = "audit.log";
+    if (!g_audit_log_path.empty()) path = g_audit_log_path.c_str();
+    else path = default_log;
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
     if (fd < 0) {
-        std::cerr << "open audit log failed" << strerror(errno) << "\n";
+        std::cerr << "Open audit log failed.\n";
         return;
     }
+
     time_t t = time(nullptr);
-    char buf[64];
-    struct tm tm;
-    localtime_r(&t, &tm);
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    char tbuf[64];
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tmv);
+
     const char* lname = "INFO";
     switch (lvl) {
         case LogLevel::INFO:  lname = "INFO"; break;
@@ -103,16 +286,120 @@ static void audit_log_level(LogLevel lvl, const std::string& entry) {
         case LogLevel::ERROR: lname = "ERROR"; break;
         case LogLevel::ALERT: lname = "ALERT"; break;
     }
-    std::string line = std::string(buf) + " [" + lname + "] " + entry + "\n";
-    if (write(fd, line.c_str(), line.size()) < 0) {
-        std::cerr << "write audit log failed" << strerror(errno) << "\n";
+
+    // ----- gather username -----
+    std::string username;
+#if defined(_WIN32)
+    {
+        char buf[256];
+        DWORD sz = sizeof(buf);
+        if (GetUserNameA(buf, &sz)) username = buf;
+        else username = "unknown";
+    }
+#else
+    {
+        const char* u = getenv("USER");
+        if (!u) u = getenv("LOGNAME");
+        username = (u ? u : "unknown");
+    }
+#endif
+
+    // ----- session id (pid) -----
+    std::string sessionId = std::to_string((long long)getpid());
+
+    // ----- IP detection -----
+    std::string ip = "127.0.0.1";
+    const char* ssh_conn = getenv("SSH_CONNECTION");
+    const char* ssh_client = getenv("SSH_CLIENT");
+
+    if (ssh_conn) {
+        // SSH_CONNECTION format is: "<client_ip> <client_port> <server_ip> <server_port>"
+        std::istringstream iss(ssh_conn);
+        iss >> ip;
+    }
+    else if (ssh_client) {
+        // SSH_CLIENT format is: "<client_ip> <client_port> <server_port>"
+        std::istringstream iss(ssh_client);
+        iss >> ip;
+    }
+
+    // ----- build message -----
+    std::ostringstream oss;
+    oss << tbuf
+        << " [" << lname << "] "
+        << "event=" << (event.empty() ? entry : event)
+        << " userId=" << username
+        << " sessionId=" << sessionId
+        << " ip=" << ip
+        << " outcome=" << (outcome.empty() ? "none" : outcome)
+        << "\n";
+
+    std::string msg = oss.str();
+
+    if (write(fd, msg.c_str(), msg.size()) < 0) {
+        std::cerr << "Write audit log failed.\n";
     }
     if (close(fd) != 0) {
-        std::cerr << "close audit log failed" << strerror(errno) << "\n";
+        std::cerr << "Close audit log failed.\n";
     }
 }
 
 static void audit_log(const std::string& entry) { audit_log_level(LogLevel::INFO, entry); }
+
+// -------- Ownership and permission checks
+static bool check_dir_ownership_and_perms(const std::string& path) {
+#if defined(_WIN32)
+    (void)path;
+    return true;
+#else
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        std::cerr << "Internal error: vault file check failed.\n";
+        return false;
+    }
+    uid_t uid = geteuid();
+    if (st.st_uid != uid) {
+        audit_log_level(LogLevel::ERROR, "Directory ownership violation: " + path);
+        std::cerr << "Internal error: vault file access check failed.\n";
+        return false;
+    }
+    mode_t perms = st.st_mode & 0777;
+    // For directories we require no group/other access
+    if ((perms & 0077) != 0) {
+        audit_log_level(LogLevel::ERROR, "Insecure directory permissions on: " + path);
+        std::cerr << "Internal error: vault file access check failed.\n";
+        return false;
+    }
+    return true;
+#endif
+}
+
+static bool check_file_ownership_and_perms(const std::string& path, bool allow_missing) {
+#if defined(_WIN32)
+    (void)path; (void)allow_missing;
+    return true;
+#else
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        if (errno == ENOENT && allow_missing) return true;
+        std::cerr << "Internal error: vault file check failed.\n";
+        return false;
+    }
+    uid_t uid = geteuid();
+    if (st.st_uid != uid) {
+        audit_log_level(LogLevel::ERROR, "File ownership violation: " + path);
+        std::cerr << "Internal error: vault file access check failed.\n";
+        return false;
+    }
+    mode_t perms = st.st_mode & 0777;
+    if ((perms & 0077) != 0) {
+        audit_log_level(LogLevel::ERROR, "Insecure file permissions on: " + path);
+        std::cerr << "Internal error: vault file access check failed.\n";
+        return false;
+    }
+    return true;
+#endif
+}
 
 
 // ---------- Secure input (returns vector<byte> so we can wipe reliably) ----------
@@ -150,60 +437,60 @@ static std::vector<byte> get_password_bytes(const char* prompt) {
     return rv;
 }
 
-// helper to convert vector<byte> to std::string (copy) and wipe the vector
-static std::string passwd_vec_to_string_and_wipe(std::vector<byte>& v) {
-    std::string s(v.begin(), v.end());
-    sodium_memzero(v.data(), v.size());
-    v.clear();
-    return s;
-}
+//// helper to convert vector<byte> to std::string (copy) and wipe the vector
+//static std::string passwd_vec_to_string_and_wipe(std::vector<byte>& v) {
+//    std::string s(v.begin(), v.end());
+//    sodium_memzero(v.data(), v.size());
+//    v.clear();
+//    return s;
+//}
 
 
-// zero and unlock memory safely
-static void secure_free(unsigned char* buf, size_t len) {
-    if (!buf || len == 0) return;
-    sodium_memzero(buf, len);
-    // attempt to munlock if possible
-#if defined(MADV_DONTNEED)
-    munlock(buf, len);
-#endif
-    free(buf);
-}
+//// zero and unlock memory safely
+//static void secure_free(unsigned char* buf, size_t len) {
+//    if (!buf || len == 0) return;
+//    sodium_memzero(buf, len);
+//    // attempt to munlock if possible
+//#if defined(MADV_DONTNEED)
+//    munlock(buf, len);
+//#endif
+//    free(buf);
+//}
 
 
-// get password
-static std::string get_password(const char* prompt) {
-    std::string pw;
-    std::cout << prompt;
-    std::fflush(stdout);
-    // turn off echo on POSIX
-    struct termios oldt, newt;
-    if (!isatty(STDIN_FILENO)) {
-        std::string tmp;
-        if (!std::getline(std::cin, tmp)) return pw;
-        pw.assign(tmp.begin(), tmp.end());
-        return pw;
-    }
-    if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
-        std::string tmp;
-        if (!std::getline(std::cin, tmp)) return pw;
-        pw.assign(tmp.begin(), tmp.end());
-        return pw;
-    }
-    newt = oldt;
-    newt.c_lflag &= ~ECHO;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) != 0) {
-        audit_log_level(LogLevel::WARN, "tcsetattr failed while disabling echo");
-    }
-    std::string tmp;
-    std::getline(std::cin, tmp);
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &oldt) != 0) {
-        audit_log_level(LogLevel::WARN, "tcsetattr failed while restoring attrs");
-    }
-    std::cout << "\n";
-    pw.assign(tmp.begin(), tmp.end());
-    return pw;
-}
+//// get password
+//static std::string get_password(const char* prompt) {
+//    std::string pw;
+//    std::cout << prompt;
+//    std::fflush(stdout);
+//    // turn off echo on POSIX
+//    struct termios oldt, newt;
+//    if (!isatty(STDIN_FILENO)) {
+//        std::string tmp;
+//        if (!std::getline(std::cin, tmp)) return pw;
+//        pw.assign(tmp.begin(), tmp.end());
+//        return pw;
+//    }
+//    if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
+//        std::string tmp;
+//        if (!std::getline(std::cin, tmp)) return pw;
+//        pw.assign(tmp.begin(), tmp.end());
+//        return pw;
+//    }
+//    newt = oldt;
+//    newt.c_lflag &= ~ECHO;
+//    if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) != 0) {
+//        audit_log_level(LogLevel::WARN, "tcsetattr failed while disabling echo");
+//    }
+//    std::string tmp;
+//    std::getline(std::cin, tmp);
+//    if (tcsetattr(STDIN_FILENO, TCSANOW, &oldt) != 0) {
+//        audit_log_level(LogLevel::WARN, "tcsetattr failed while restoring attrs");
+//    }
+//    std::cout << "\n";
+//    pw.assign(tmp.begin(), tmp.end());
+//    return pw;
+//}
 
 
 // ---------- Base64 helpers ----------
@@ -232,6 +519,347 @@ static std::vector<byte> from_base64(const std::string& b64) {
     if (out_len > out.size()) return {}; // sanity guard (no malformed base64 strings)
     out.resize(out_len);
     return out;
+}
+
+
+// ---------------- Cross-platform clipboard helpers ----------------
+static bool run_writer_with_stdin(const std::vector<const char*>& argv, const std::string& input) {
+#if defined(_WIN32)
+    (void)argv; (void)input;
+    return false; // Will not be used on Windows.
+#else
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return false;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]); close(pipefd[1]);
+        return false;
+    }
+    if (pid == 0) {
+        // child: replace stdin with read end
+        dup2(pipefd[0], STDIN_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+
+        // build argv for exec
+        std::vector<char*> args;
+        for (auto p : argv) args.push_back(const_cast<char*>(p));
+        args.push_back(nullptr);
+        // execvp is safe here because argv[0] is a literal from code or user-checked path
+        execvp(args[0], args.data());
+        _exit(127); // exec failed
+    }
+    // parent: write then close write-end
+    close(pipefd[0]);
+    ssize_t to_write = (ssize_t)input.size();
+    const char* buf = input.data();
+    while (to_write > 0) {
+        ssize_t w = write(pipefd[1], buf, to_write);
+        if (w <= 0) break;
+        buf += w;
+        to_write -= w;
+    }
+    close(pipefd[1]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
+}
+
+static bool run_reader_to_string(const std::vector<const char*>& argv, std::string& out) {
+#if defined(_WIN32)
+    (void)argv; (void)out;
+    return false;
+#else
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return false;
+
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return false; }
+    if (pid == 0) {
+        // child: replace stdout with write end
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[0]); close(pipefd[1]);
+        std::vector<char*> args;
+        for (auto p : argv) args.push_back(const_cast<char*>(p));
+        args.push_back(nullptr);
+        execvp(args[0], args.data());
+        _exit(127);
+    }
+    // parent: read
+    close(pipefd[1]);
+    std::string s;
+    char buf[4096];
+    ssize_t r;
+    while ((r = read(pipefd[0], buf, sizeof(buf))) > 0) {
+        s.append(buf, buf + r);
+        if (s.size() > 1024 * 1024) break; // avoid insane size
+    }
+    close(pipefd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return false;
+    // trim trailing newlines
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    out.swap(s);
+    return true;
+#endif
+}
+
+
+// Windows section ---------------
+#if defined(_WIN32)
+static bool clipboard_set_win(const std::string& data) {
+    if (!OpenClipboard(nullptr)) return false;
+    if (!EmptyClipboard()) { CloseClipboard(); return false; }
+    SIZE_T lenBytes = (data.size() + 1);
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, lenBytes);
+    if (!h) { CloseClipboard(); return false; }
+    void* p = GlobalLock(h);
+    if (!p) { GlobalFree(h); CloseClipboard(); return false; }
+    memcpy(p, data.data(), data.size());
+    // Ensure trailing NUL
+    ((char*)p)[data.size()] = '\0';
+    GlobalUnlock(h);
+    if (!SetClipboardData(CF_TEXT, h)) {
+        GlobalFree(h);
+        CloseClipboard();
+        return false;
+    }
+    // Do not free h after SetClipboardData successful (system owns it).
+    CloseClipboard();
+    return true;
+}
+
+static bool clipboard_get_win(std::string& out) {
+    out.clear();
+    if (!OpenClipboard(nullptr)) return false;
+    HANDLE h = GetClipboardData(CF_TEXT);
+    if (!h) { CloseClipboard(); return false; }
+    char* p = static_cast<char*>(GlobalLock(h));
+    if (!p) { CloseClipboard(); return false; }
+    out.assign(p);
+    GlobalUnlock(h);
+    CloseClipboard();
+    return true;
+}
+
+static bool clipboard_clear_win() {
+    if (!OpenClipboard(nullptr)) return false;
+    bool ok = EmptyClipboard();
+    CloseClipboard();
+    return ok;
+}
+
+static bool windows_clipboard_history_enabled() {
+    HKEY hKey;
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+
+    // HKCU\Software\Microsoft\Clipboard\EnableClipboardHistory
+    if (RegOpenKeyExA(
+        HKEY_CURRENT_USER,
+        "Software\\Microsoft\\Clipboard",
+        0,
+        KEY_READ,
+        &hKey) != ERROR_SUCCESS)
+    {
+        return false; // key missing → treat as disabled
+    }
+
+    LONG result = RegQueryValueExA(
+        hKey,
+        "EnableClipboardHistory",
+        NULL,
+        NULL,
+        (LPBYTE)&value,
+        &size
+    );
+    RegCloseKey(hKey);
+
+    if (result != ERROR_SUCCESS) {
+        return false;
+    }
+
+    return (value == 1);
+}
+#endif
+// ----------------
+
+// WSL section ---------------
+static bool wsl_clipboard_history_enabled() {
+    const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+    if (access(pwsh, X_OK) != 0) return false; // not WSL or no pwsh
+
+    std::vector<const char*> args = {
+        pwsh,
+        "-NoProfile",
+        "-Command",
+        "(Get-ItemProperty HKCU:\\Software\\Microsoft\\Clipboard).EnableClipboardHistory"
+    };
+
+    std::string out;
+    if (!run_reader_to_string(args, out)) return false;
+
+    // PowerShell outputs e.g. "1" or "0" or empty
+    return (out == "1");
+}
+
+
+static bool running_in_wsl() {
+    FILE* f = fopen("/proc/version", "r");
+    if (!f) return false;
+
+    char buf[256];
+    size_t nread = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+
+    if (nread == 0) {
+        // Could not read; assume not WSL.
+        return false;
+    }
+
+    buf[nread] = '\0';  // explicit NUL-termination
+
+    return (strstr(buf, "Microsoft") || strstr(buf, "WSL"));
+}
+// ----------------
+
+static bool clipboard_set_posix(const std::string& data) {
+    // prefer wl-copy (Wayland), then pbcopy (macOS), then xclip/xsel
+    const std::vector<std::vector<const char*>> writers = {
+        { "wl-copy", "--no-newline" },      // wl-copy doesn't add newline if we pass option
+        { "pbcopy" },                       // macOS
+        { "xclip", "-selection", "clipboard" },
+        { "xsel", "--clipboard", "--input" }
+    };
+    for (const auto& a : writers) {
+        if (access(a[0], X_OK) == 0) {
+            if (run_writer_with_stdin(a, data)) return true;
+        }
+    }
+    // WSL integration
+    if (running_in_wsl()) {
+        const char* winclip = "/mnt/c/Windows/System32/clip.exe";
+        const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+        if (access(winclip, X_OK) == 0 && access(pwsh, X_OK) == 0) {
+            std::vector<const char*> args = { winclip };
+            return run_writer_with_stdin(args, data);
+        }
+    }
+    return false;
+}
+
+static bool clipboard_get_posix(std::string& out) {
+    const std::vector<std::vector<const char*>> readers = {
+        { "wl-paste", "--no-newline" },
+        { "pbpaste" },
+        { "xclip", "-selection", "clipboard", "-o" },
+        { "xsel", "--clipboard", "--output" }
+    };
+    for (const auto& a : readers) {
+        if (access(a[0], X_OK) == 0) {
+            if (run_reader_to_string(a, out)) return true;
+        }
+    }
+
+    // WSL integration
+    if (running_in_wsl()) {
+        const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+        if (access(pwsh, X_OK) == 0) {
+            std::vector<const char*> args = {
+                pwsh,
+                "-NoProfile",
+                "-Command",
+                "Get-Clipboard"
+            };
+            return run_reader_to_string(args, out);
+        }
+    }
+    return false;
+}
+
+static bool clipboard_clear_posix() {
+    // Clearing: set empty string
+    return clipboard_set_posix(std::string());
+
+    // WSL: clear Windows clipboard via clip.exe
+    if (running_in_wsl()) {
+        const char* winclip = "/mnt/c/Windows/System32/clip.exe";
+        if (access(winclip, X_OK) == 0) {
+            std::vector<const char*> args = { winclip };
+            return run_writer_with_stdin(args, "");
+        }
+    }
+}
+
+// High-level small wrappers:
+static bool clipboard_set(const std::string& data) {
+#if defined(_WIN32)
+    return clipboard_set_win(data);
+#else
+    return clipboard_set_posix(data);
+#endif
+}
+
+static bool clipboard_get(std::string& out) {
+#if defined(_WIN32)
+    return clipboard_get_win(out);
+#else
+    return clipboard_get_posix(out);
+#endif
+}
+
+static bool clipboard_clear() {
+#if defined(_WIN32)
+    return clipboard_clear_win();
+#else
+    return clipboard_clear_posix();
+#endif
+}
+
+// copy with timed clear: copies data to clipboard and clears after `seconds` only if the
+// clipboard still contains identical content. zeroes local buffers used.
+static void copy_with_timed_clear(const std::string& secret, unsigned seconds) {
+    if (secret.empty()) return;
+    std::vector<unsigned char> buf(secret.begin(), secret.end());
+    bool ok = false;
+#if defined(_WIN32)
+    std::string tmp((char*)buf.data(), buf.size());
+    ok = clipboard_set(tmp);
+    sodium_memzero((void*)tmp.data(), tmp.size());
+#else
+    std::string tmp((char*)buf.data(), buf.size());
+    ok = clipboard_set(tmp);
+    sodium_memzero((void*)tmp.data(), tmp.size());
+#endif
+    sodium_memzero(buf.data(), buf.size());
+    buf.clear();
+
+    if (!ok) {
+        audit_log_level(LogLevel::WARN, "clipboard_set failed for timed copy");
+        return;
+    }
+
+    std::thread([secret, seconds]() {
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        std::string current;
+        if (!clipboard_get(current)) {
+            return;
+        }
+        std::string expected = secret;
+        // compare exactly, if matches, clear
+        if (current == expected) {
+            clipboard_clear();
+            audit_log_level(LogLevel::INFO, "Clipboard cleared after timeout");
+        }
+        // wipe current
+        if (!current.empty()) {
+            sodium_memzero(&current[0], current.size());
+        }
+        }).detach();
 }
 
 
@@ -321,6 +949,66 @@ static Vault deserialize_vault(const std::string& s) {
 }
 
 
+// ---------- Multi-vault initialization ----------
+static bool init_vault_paths_interactive() {
+    std::string home = get_user_home_dir();
+#if defined(_WIN32)
+    const char sep = '\\';
+    g_vault_root = home + "\\.passman";
+    std::string vaults_dir = g_vault_root + "\\vaults";
+#else
+    const char sep = '/';
+    g_vault_root = home + "/.passman";
+    std::string vaults_dir = g_vault_root + "/vaults";
+#endif
+    if (!ensure_dir_exists(g_vault_root, S_IRWXU)) {
+        return false;
+    }
+    if (!ensure_dir_exists(vaults_dir, S_IRWXU)) {
+        return false;
+    }
+
+    // choose vault name
+    while (true) {
+        std::cout << "Select vault name (e.g. 'default'): ";
+        if (!std::getline(std::cin, g_vault_name)) {
+            return false;
+        }
+        if (!valid_vault_name(g_vault_name)) {
+            std::cout << "Invalid vault name. Use only letters, digits, '_' or '-', max " << MAX_VAULT_NAME_LEN << " characters.\n";
+            continue;
+        }
+        break;
+    }
+
+    // build per-vault directory & paths
+    g_vault_dir = vaults_dir + sep + g_vault_name;
+    if (!ensure_dir_exists(g_vault_dir, S_IRWXU)) {
+        return false;
+    }
+#if defined(_WIN32)
+    g_vault_filename = g_vault_dir + "\\vault.bin";
+    g_meta_filename = g_vault_dir + "\\vault.meta";
+    g_audit_log_path = g_vault_dir + "\\audit.log";
+#else
+    g_vault_filename = g_vault_dir + "/vault.bin";
+    g_meta_filename = g_vault_dir + "/vault.meta";
+    g_audit_log_path = g_vault_dir + "/audit.log";
+#endif
+    // enforce per-user ownership and tight permissions on vault dir
+    if (!check_dir_ownership_and_perms(g_vault_dir)) {
+        return false;
+    }
+
+    // if files don't exist yet
+    if (!check_file_ownership_and_perms(g_vault_filename, true)) return false;
+    if (!check_file_ownership_and_perms(g_meta_filename, true)) return false;
+    if (!check_file_ownership_and_perms(g_audit_log_path, true)) return false;
+
+    return true;
+}
+
+
 // -------- Crypto helpers --------
 static bool derive_key_from_password(const byte* pw, size_t pw_len, const byte salt[SALT_LEN], byte key[KEY_LEN]) {
     if (!pw || pw_len == 0) return false;
@@ -376,7 +1064,7 @@ static bool decrypt_vault_blob(const byte key[KEY_LEN], const byte *ct, size_t c
         sodium_memzero(*out_plain, ct_len);
         free(*out_plain);
         *out_plain = nullptr;
-        audit_log_level(LogLevel::WARN, "decrypt_vault_blob: authentication failed");
+        audit_log_level(LogLevel::ERROR, "decrypt_vault_blob: authentication failed");
         return false;
     }
     *out_plain_len = (size_t)mlen;
@@ -434,7 +1122,7 @@ static bool save_meta(const byte salt[SALT_LEN], const byte nonce[NONCE_LEN]) {
     std::string b64nonce = to_base64(nonce, NONCE_LEN);
     std::string content = b64salt + "\n" + b64nonce + "\n";
     // atomic write
-    if (!atomic_write_file(META_FILENAME, reinterpret_cast<const byte*>(content.data()), content.size())) {
+    if (!atomic_write_file(g_meta_filename, reinterpret_cast<const byte*>(content.data()), content.size())) {
         audit_log_level(LogLevel::ERROR, "save_meta: atomic write failed");
         return false;
     }
@@ -443,7 +1131,7 @@ static bool save_meta(const byte salt[SALT_LEN], const byte nonce[NONCE_LEN]) {
 
 
 static bool load_meta(byte salt[SALT_LEN], byte nonce[NONCE_LEN]) {
-    FILE* f = fopen(META_FILENAME, "r");
+    FILE* f = fopen(g_meta_filename.c_str(), "r");
     if (!f) {
         audit_log_level(LogLevel::ERROR, "load_meta: fopen failed");
         return false;
@@ -486,7 +1174,7 @@ static bool load_meta(byte salt[SALT_LEN], byte nonce[NONCE_LEN]) {
 
 
 static bool load_vault_ciphertext(std::vector<byte>& ct) {
-    FILE* f = fopen(VAULT_FILENAME, "rb");
+    FILE* f = fopen(g_vault_filename.c_str(), "rb");
     if (!f) return false;
     if (fseek(f, 0, SEEK_END) != 0) {
         fclose(f);
@@ -574,6 +1262,13 @@ static void print_menu() {
 
 // ---------- Main program ----------
 int main() {
+    init_log_context();
+
+    if (!init_vault_paths_interactive()) {
+        std::fprintf(stderr, "Failed to initialize vault paths.\n");
+        return 1;
+    }
+
     if (sodium_init() < 0) {
         std::fprintf(stderr, "An unexpected error occurred. Check audit log for details.\n");
         audit_log_level(LogLevel::ERROR, "libsodium init failed");
@@ -588,8 +1283,7 @@ int main() {
     sodium_memzero(nonce, NONCE_LEN);
 
     // Check if vault exists; if not, run init
-    bool vault_exists = (access(VAULT_FILENAME, F_OK) == 0 && access(META_FILENAME, F_OK) == 0);
-
+    bool vault_exists = (access(g_vault_filename.c_str(), F_OK) == 0 && access(g_meta_filename.c_str(), F_OK) == 0);
     if (!vault_exists) {
         std::cout << "No vault found. Initialize new vault.\n";
         // generate salt and ask master password twice
@@ -630,7 +1324,7 @@ int main() {
             sodium_memzero(pw1.data(), pw1.size()); sodium_memzero(pw2.data(), pw2.size());
             return cleanup_and_exit(3, vault, key, salt, nonce);
         }
-        if (!atomic_write_file(VAULT_FILENAME, ct, ct_len) || !save_meta(salt, new_nonce)) {
+        if (!atomic_write_file(g_vault_filename, ct, ct_len) || !save_meta(salt, new_nonce)) {
             audit_log_level(LogLevel::ERROR, "Vault init: saving vault/meta failed");
             std::cerr << "An unexpected error occurred. Check audit log.\n";
             sodium_memzero(ct, ct_len);
@@ -644,8 +1338,16 @@ int main() {
         sodium_memzero(pw2.data(), pw2.size());
         sodium_memzero(key, KEY_LEN);
         std::cout << "Vault initialized. Restart to open.\n";
+        std::cerr << g_vault_filename + "\n";
         audit_log_level(LogLevel::INFO, "New vault initialized");
         return 0;
+    }
+
+    // For existing vaults, re-check per-user ownership on files
+    if (!check_file_ownership_and_perms(g_vault_filename, false) ||
+        !check_file_ownership_and_perms(g_meta_filename, false)) {
+        std::cerr << "Vault files do not meet security requirements.\n";
+        return cleanup_and_exit(2, vault, key, salt, nonce);
     }
 
     // Loading metadata
@@ -948,37 +1650,75 @@ int main() {
             }
             audit_log_level(LogLevel::INFO, "Copy requested for " + label);
 
-            // Secure buffer allocation (mlock)
-            size_t len = it->second.password.size();
-            if (len == 0 || len > MAX_PASS_LEN) {
-                std::cout << "Password invalid size\n";
-                continue;
-            }
-            byte* buf = (byte*)malloc(len + 1);
-            if (!buf) {
-                std::cout << "Alloc fail\n";
-                continue;
-            }
-            memcpy(buf, it->second.password.data(), len);
-            buf[len] = 0;
+            std::cout << "Copy to: (1) secure internal buffer (current behavior)  (2) system clipboard (timed clear)\n";
+            std::cout << "Choose 1 or 2: ";
+            std::string opt; std::getline(std::cin, opt);
+
+            if (opt == "1") {
+                // Secure buffer allocation (mlock)
+                size_t len = it->second.password.size();
+                if (len == 0 || len > MAX_PASS_LEN) {
+                    std::cout << "Password invalid size\n";
+                    continue;
+                }
+                byte* buf = (byte*)malloc(len + 1);
+                if (!buf) {
+                    std::cout << "Alloc fail\n";
+                    continue;
+                }
+                memcpy(buf, it->second.password.data(), len);
+                buf[len] = 0;
 
 #if defined(MADV_DONTNEED)
-            if (mlock(buf, len + 1) != 0) {
-                audit_log_level(LogLevel::WARN, "mlock failed for secure buffer");
-            }
+                if (mlock(buf, len + 1) != 0) {
+                    audit_log_level(LogLevel::WARN, "mlock failed for secure buffer");
+                }
 #endif
 
-            std::cout << "Password copied to secure buffer (NOT system clipboard). Press Enter to clear it now.\n";
-            audit_log_level(LogLevel::INFO, "Credential copied to secure buffer for " + label);
-            std::string dummy;
-            std::getline(std::cin, dummy);
-            // clear buffer
-            sodium_memzero(buf, len + 1);
+                std::cout << "Password copied to secure buffer (NOT system clipboard). Press Enter to clear it now.\n";
+                audit_log_level(LogLevel::INFO, "Credential copied to secure buffer for " + label);
+                std::string dummy;
+                std::getline(std::cin, dummy);
+                // clear buffer
+                sodium_memzero(buf, len + 1);
 #if defined(MADV_DONTNEED)
-            munlock(buf, len + 1);
+                munlock(buf, len + 1);
 #endif
-            free(buf);
-            audit_log_level(LogLevel::INFO, "Secure buffer cleared for " + label);
+                free(buf);
+                audit_log_level(LogLevel::INFO, "Secure buffer cleared for " + label);
+            }
+            else if (opt == "2") {
+#if defined(_WIN32)
+                if (windows_clipboard_history_enabled()) {
+                    std::cout << "WARNING: Windows Clipboard History is enabled.\n";
+                    std::cout << "Passwords you copy may remain visible in Win+V history.\n";
+                }
+#else
+                if (running_in_wsl()) {
+                    if (wsl_clipboard_history_enabled()) {
+                        std::cout << "WARNING: Windows Clipboard History is enabled.\n";
+                        std::cout << "Passwords you copy may remain visible in Win+V history.\n";
+                    }
+                }
+#endif
+                // system clipboard flow
+                unsigned timeout_secs = 15; // default
+                std::cout << "Timeout seconds (default 15): ";
+                std::string ts; std::getline(std::cin, ts);
+                if (!ts.empty()) {
+                    try { timeout_secs = std::stoul(ts); }
+                    catch (...) { timeout_secs = 15; }
+                    if (timeout_secs > 600) timeout_secs = 600; // cap
+                }
+
+                // Copy with timed clear
+                copy_with_timed_clear(it->second.password, timeout_secs);
+                audit_log_level(LogLevel::INFO, "Copy requested for " + label + " -> system clipboard (timed for " + std::to_string(timeout_secs) + ")");
+                std::cout << "Password copied to system clipboard for " << timeout_secs << " seconds. Action logged.\n";
+            }
+            else {
+                std::cout << "Invalid option\n";
+            }
         }
         else if (choice == "7") { // ------ Exit the password manager ------ 
             running = false;
@@ -1036,10 +1776,9 @@ int main() {
             sodium_memzero(salt, SALT_LEN);
             sodium_memzero(nonce, NONCE_LEN);
 
-            secure_delete_file(VAULT_FILENAME);
-            secure_delete_file(META_FILENAME);
-
-            audit_log_level(LogLevel::ALERT, "Vault deleted by user request and memory cleared");
+            secure_delete_file(g_vault_filename.c_str());
+            secure_delete_file(g_meta_filename.c_str());
+            secure_delete_file(g_audit_log_path.c_str());
 
             std::cout << "Vault deleted.\n";
             running = false;
