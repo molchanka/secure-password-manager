@@ -14,6 +14,7 @@
     #include <sys/wait.h>
     #include <spawn.h>
     extern char** environ;
+    #include <pwd.h>
 #endif
 
 #include <cstdio>
