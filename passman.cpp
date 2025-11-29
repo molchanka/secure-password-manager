@@ -184,8 +184,7 @@ static void init_log_context() {
     g_log_ctx.ip = get_client_ip();
 }
 
-static void audit_log_level(LogLevel lvl, const std::string& entry) {
-    // append entry to audit log with 0600 perms
+static void audit_log_level(LogLevel lvl, const std::string& entry, const std::string& event = "", const std::string& outcome = "") {
     int fd = open(AUDIT_LOG, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
     if (fd < 0) {
         std::cerr << "open audit log failed" << strerror(errno) << "\n";
@@ -193,46 +192,70 @@ static void audit_log_level(LogLevel lvl, const std::string& entry) {
     }
 
     time_t t = time(nullptr);
-    char buf[64];
-    struct tm tm;
-    localtime_r(&t, &tm);
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
-
+    char tbuf[64];
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tmv);
 
     const char* lname = "INFO";
-    std::string event = "info";
-    std::string outcome = "success";
-
     switch (lvl) {
-        case LogLevel::INFO:
-            lname = "INFO";
-            event = "info";
-            outcome = "success";
-            break;
-        case LogLevel::WARN:
-            lname = "WARN";
-            event = "warning";
-            outcome = "warning";
-            break;
-        case LogLevel::ERROR:
-            lname = "ERROR";
-            event = "error";
-            outcome = "failure";
-            break;
-        case LogLevel::ALERT:
-            lname = "ALERT";
-            event = "alert";
-            outcome = "critical";
-            break;
+    case LogLevel::INFO:  lname = "INFO"; break;
+    case LogLevel::WARN:  lname = "WARN"; break;
+    case LogLevel::ERROR: lname = "ERROR"; break;
+    case LogLevel::ALERT: lname = "ALERT"; break;
     }
 
-    if (!entry.empty()) {
-        oss << " detail=" << entry;
+    // ----- gather username -----
+    std::string username;
+#if defined(_WIN32)
+    {
+        char buf[256];
+        DWORD sz = sizeof(buf);
+        if (GetUserNameA(buf, &sz)) username = buf;
+        else username = "unknown";
     }
-    oss << "\n";
+#else
+    {
+        const char* u = getenv("USER");
+        if (!u) u = getenv("LOGNAME");
+        username = (u ? u : "unknown");
+    }
+#endif
 
-    std::string line = std::string(buf) + " [" + lname + "] " + entry + "\n";
-    if (write(fd, line.c_str(), line.size()) < 0) {
+    // ----- session id (pid) -----
+    std::string sessionId = std::to_string((long long)getpid());
+
+    // ----- IP detection -----
+    std::string ip = "127.0.0.1";
+    const char* ssh_conn = getenv("SSH_CONNECTION");
+    const char* ssh_client = getenv("SSH_CLIENT");
+
+    if (ssh_conn) {
+        // SSH_CONNECTION format is: "<client_ip> <client_port> <server_ip> <server_port>"
+        std::istringstream iss(ssh_conn);
+        iss >> ip;
+    }
+    else if (ssh_client) {
+        // SSH_CLIENT format is: "<client_ip> <client_port> <server_port>"
+        std::istringstream iss(ssh_client);
+        iss >> ip;
+    }
+
+    // ----- build message -----
+    std::ostringstream oss;
+    oss << tbuf
+        << " [" << lname << "] "
+        << "event=" << (event.empty() ? entry : event)
+        << " userId=" << username
+        << " sessionId=" << sessionId
+        << " ip=" << ip
+        << " outcome=" << (outcome.empty() ? "none" : outcome)
+        << " detail=" << entry
+        << "\n";
+
+    std::string msg = oss.str();
+
+    if (write(fd, msg.c_str(), msg.size()) < 0) {
         std::cerr << "write audit log failed" << strerror(errno) << "\n";
     }
     if (close(fd) != 0) {
@@ -278,60 +301,60 @@ static std::vector<byte> get_password_bytes(const char* prompt) {
     return rv;
 }
 
-// helper to convert vector<byte> to std::string (copy) and wipe the vector
-static std::string passwd_vec_to_string_and_wipe(std::vector<byte>& v) {
-    std::string s(v.begin(), v.end());
-    sodium_memzero(v.data(), v.size());
-    v.clear();
-    return s;
-}
+//// helper to convert vector<byte> to std::string (copy) and wipe the vector
+//static std::string passwd_vec_to_string_and_wipe(std::vector<byte>& v) {
+//    std::string s(v.begin(), v.end());
+//    sodium_memzero(v.data(), v.size());
+//    v.clear();
+//    return s;
+//}
 
 
-// zero and unlock memory safely
-static void secure_free(unsigned char* buf, size_t len) {
-    if (!buf || len == 0) return;
-    sodium_memzero(buf, len);
-    // attempt to munlock if possible
-#if defined(MADV_DONTNEED)
-    munlock(buf, len);
-#endif
-    free(buf);
-}
+//// zero and unlock memory safely
+//static void secure_free(unsigned char* buf, size_t len) {
+//    if (!buf || len == 0) return;
+//    sodium_memzero(buf, len);
+//    // attempt to munlock if possible
+//#if defined(MADV_DONTNEED)
+//    munlock(buf, len);
+//#endif
+//    free(buf);
+//}
 
 
-// get password
-static std::string get_password(const char* prompt) {
-    std::string pw;
-    std::cout << prompt;
-    std::fflush(stdout);
-    // turn off echo on POSIX
-    struct termios oldt, newt;
-    if (!isatty(STDIN_FILENO)) {
-        std::string tmp;
-        if (!std::getline(std::cin, tmp)) return pw;
-        pw.assign(tmp.begin(), tmp.end());
-        return pw;
-    }
-    if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
-        std::string tmp;
-        if (!std::getline(std::cin, tmp)) return pw;
-        pw.assign(tmp.begin(), tmp.end());
-        return pw;
-    }
-    newt = oldt;
-    newt.c_lflag &= ~ECHO;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) != 0) {
-        audit_log_level(LogLevel::WARN, "tcsetattr failed while disabling echo");
-    }
-    std::string tmp;
-    std::getline(std::cin, tmp);
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &oldt) != 0) {
-        audit_log_level(LogLevel::WARN, "tcsetattr failed while restoring attrs");
-    }
-    std::cout << "\n";
-    pw.assign(tmp.begin(), tmp.end());
-    return pw;
-}
+//// get password
+//static std::string get_password(const char* prompt) {
+//    std::string pw;
+//    std::cout << prompt;
+//    std::fflush(stdout);
+//    // turn off echo on POSIX
+//    struct termios oldt, newt;
+//    if (!isatty(STDIN_FILENO)) {
+//        std::string tmp;
+//        if (!std::getline(std::cin, tmp)) return pw;
+//        pw.assign(tmp.begin(), tmp.end());
+//        return pw;
+//    }
+//    if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
+//        std::string tmp;
+//        if (!std::getline(std::cin, tmp)) return pw;
+//        pw.assign(tmp.begin(), tmp.end());
+//        return pw;
+//    }
+//    newt = oldt;
+//    newt.c_lflag &= ~ECHO;
+//    if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) != 0) {
+//        audit_log_level(LogLevel::WARN, "tcsetattr failed while disabling echo");
+//    }
+//    std::string tmp;
+//    std::getline(std::cin, tmp);
+//    if (tcsetattr(STDIN_FILENO, TCSANOW, &oldt) != 0) {
+//        audit_log_level(LogLevel::WARN, "tcsetattr failed while restoring attrs");
+//    }
+//    std::cout << "\n";
+//    pw.assign(tmp.begin(), tmp.end());
+//    return pw;
+//}
 
 
 // ---------- Base64 helpers ----------
