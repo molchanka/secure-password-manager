@@ -27,4 +27,5 @@ int cleanup_and_exit(
 void secure_clear_vault(Vault& v);
 
 // ---------- Menu ----------
+void clear_screen();
 void print_menu();

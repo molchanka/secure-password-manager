@@ -1,6 +1,12 @@
 #include "util.hpp"
 #include "vault.hpp"
 
+#if !defined(_WIN32)
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <termios.h>
+#endif
+
 // ---------- SessionID ----------
 std::string generate_session_id() {
     unsigned char buf[16];
@@ -119,7 +125,30 @@ int cleanup_and_exit(int code, Vault& vault, unsigned char key[KEY_LEN],
 }
 
 // ---------- Program flow helpers ----------
+void clear_screen() {
+#if defined(_WIN32)
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    DWORD cellCount, count;
+    COORD homeCoords = { 0, 0 };
+
+    if (hOut == INVALID_HANDLE_VALUE) return;
+
+    if (!GetConsoleScreenBufferInfo(hOut, &csbi)) return;
+    cellCount = csbi.dwSize.X * csbi.dwSize.Y;
+
+    FillConsoleOutputCharacter(hOut, ' ', cellCount, homeCoords, &count);
+    FillConsoleOutputAttribute(hOut, csbi.wAttributes, cellCount, homeCoords, &count);
+    SetConsoleCursorPosition(hOut, homeCoords);
+#else
+    // secure erase (visible + scrollback)
+    std::cout << "\033[3J\033[2J\033[H";
+#endif
+}
+
 void print_menu() {
+    clear_screen();
+    std::cout << "\n";
     std::cout << "SecurePass CLI - Menu:\n";
     std::cout << "1) List credentials\n";
     std::cout << "2) Add credential (+New)\n";
@@ -128,5 +157,5 @@ void print_menu() {
     std::cout << "5) Reveal credential (logs action)\n";
     std::cout << "6) Copy credential to secure buffer\n";
     std::cout << "7) Quit\n";
-    std::cout << "8) Delete entire vault / Create new vault\n";
+    std::cout << "8) Delete current vault\n";
 }
