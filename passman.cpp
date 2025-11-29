@@ -33,6 +33,7 @@
 #include <chrono>
 #include <atomic>
 #include <cctype>
+#include <random>
 
 
 
@@ -1053,6 +1054,8 @@ static void print_menu() {
 
 // ---------- Main program ----------
 int main() {
+    init_log_context();
+
     if (sodium_init() < 0) {
         std::fprintf(stderr, "An unexpected error occurred. Check audit log for details.\n");
         audit_log_level(LogLevel::ERROR, "libsodium init failed");
