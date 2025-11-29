@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
+#include <sys/types.h>
 #if defined(_WIN32)
     #include <windows.h>
 #else
@@ -15,6 +16,7 @@
     #include <spawn.h>
     extern char** environ;
     #include <pwd.h>
+    #include <dirent.h>
 #endif
 
 #include <cstdio>
@@ -56,6 +58,8 @@ static constexpr size_t MEMLIMIT = crypto_pwhash_MEMLIMIT_MODERATE;
 static constexpr size_t MAX_USER_LEN = 256;
 static constexpr size_t MAX_PASS_LEN = 1024;
 static constexpr size_t MAX_LABEL_LEN = 256;
+static constexpr size_t MAX_VAULT_NAME_LEN = 64;
+static constexpr size_t MAX_NOTES_LEN = 4096;
 static constexpr size_t MAX_VAULT_SIZE = 10 * 1024 * 1024; // 10 MB hard cap
 
 using byte = unsigned char;
@@ -71,7 +75,6 @@ using Vault = std::map<std::string, Cred>; // key by label
 
 
 // ---------- SessionID ---------- 
-
 static std::string generate_session_id() {
     unsigned char buf[16];
     std::random_device rd;
@@ -87,6 +90,15 @@ static std::string generate_session_id() {
     }
     return std::string(out);
 }
+
+
+// -------- Global vault paths --------
+static std::string g_vault_root;       // e.g. /home/user/.securepass/vaults
+static std::string g_vault_dir;        // e.g. /home/user/.securepass/vaults/default
+static std::string g_vault_name;       // e.g. "default"
+static std::string g_vault_filename;   // g_vault_dir + "/vault.bin"
+static std::string g_meta_filename;    // g_vault_dir + "/vault.meta"
+static std::string g_audit_log_path;   // g_vault_dir + "/audit.log"
 
 
 // ---------- Helpers: input validation ----------
@@ -112,6 +124,71 @@ static bool valid_password(const std::string& s) {
     if (s.size() > MAX_PASS_LEN) return false;
     if (contains_control_or_tab_or_null(s)) return false;
     return true;
+}
+
+static bool valid_vault_name(const std::string& v) {
+    if (v.empty()) return false;
+    if (v.size() > MAX_VAULT_NAME_LEN) return false;
+    for (unsigned char c : v) {
+        if (!(std::isalnum(c) || c == '_' || c == '-')) { // allow alnum, '_', '-'
+            return false;
+        }
+    }
+    return true;
+}
+
+
+// ---------- Vault name and path helpers ----------
+static std::string get_user_home_dir() {
+#if defined(_WIN32)
+    const char* home = std::getenv("USERPROFILE");
+    if (!home || !*home) {
+        home = std::getenv("HOMEPATH");
+    }
+    if (!home || !*home) {
+        return ".";
+    }
+    return std::string(home);
+#else
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) {
+        struct passwd* pw = getpwuid(geteuid());
+        if (pw && pw->pw_dir) {
+            home = pw->pw_dir;
+        }
+    }
+    if (!home || !*home) return ".";
+    return std::string(home);
+#endif
+}
+
+static bool ensure_dir_exists(const std::string & path, mode_t mode) {
+#if defined(_WIN32)
+    if (_mkdir(path.c_str()) != 0 && errno != EEXIST) {
+        std::cerr << "Failed to create directory " << path << ": " << strerror(errno) << "\n";
+        return false;
+    }
+    return true;
+#else
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            std::cerr << path << " exists but is not a directory\n";
+            return false;
+        }
+        if ((st.st_mode & 0777) != mode) {
+            chmod(path.c_str(), mode);
+        }
+        return true;
+    }
+    if (mkdir(path.c_str(), mode) != 0) {
+        if (errno != EEXIST) {
+            std::cerr << "Failed to create directory " << path << ": " << strerror(errno) << "\n";
+            return false;
+        }
+    }
+    return true;
+#endif
 }
 
 
@@ -185,9 +262,14 @@ static void init_log_context() {
 }
 
 static void audit_log_level(LogLevel lvl, const std::string& entry, const std::string& event = "", const std::string& outcome = "") {
-    int fd = open(AUDIT_LOG, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    //int fd = open(AUDIT_LOG, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    const char* path = nullptr;
+    static const char* default_log = "audit.log";
+    if (!g_audit_log_path.empty()) path = g_audit_log_path.c_str();
+    else path = default_log;
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
     if (fd < 0) {
-        std::cerr << "open audit log failed" << strerror(errno) << "\n";
+        std::cerr << "Open audit log failed.\n";
         return;
     }
 
@@ -199,10 +281,10 @@ static void audit_log_level(LogLevel lvl, const std::string& entry, const std::s
 
     const char* lname = "INFO";
     switch (lvl) {
-    case LogLevel::INFO:  lname = "INFO"; break;
-    case LogLevel::WARN:  lname = "WARN"; break;
-    case LogLevel::ERROR: lname = "ERROR"; break;
-    case LogLevel::ALERT: lname = "ALERT"; break;
+        case LogLevel::INFO:  lname = "INFO"; break;
+        case LogLevel::WARN:  lname = "WARN"; break;
+        case LogLevel::ERROR: lname = "ERROR"; break;
+        case LogLevel::ALERT: lname = "ALERT"; break;
     }
 
     // ----- gather username -----
@@ -250,20 +332,74 @@ static void audit_log_level(LogLevel lvl, const std::string& entry, const std::s
         << " sessionId=" << sessionId
         << " ip=" << ip
         << " outcome=" << (outcome.empty() ? "none" : outcome)
-        << " detail=" << entry
         << "\n";
 
     std::string msg = oss.str();
 
     if (write(fd, msg.c_str(), msg.size()) < 0) {
-        std::cerr << "write audit log failed" << strerror(errno) << "\n";
+        std::cerr << "Write audit log failed.\n";
     }
     if (close(fd) != 0) {
-        std::cerr << "close audit log failed" << strerror(errno) << "\n";
+        std::cerr << "Close audit log failed.\n";
     }
 }
 
 static void audit_log(const std::string& entry) { audit_log_level(LogLevel::INFO, entry); }
+
+// -------- Ownership and permission checks
+static bool check_dir_ownership_and_perms(const std::string& path) {
+#if defined(_WIN32)
+    (void)path;
+    return true;
+#else
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        std::cerr << "Internal error: vault file check failed.\n";
+        return false;
+    }
+    uid_t uid = geteuid();
+    if (st.st_uid != uid) {
+        audit_log_level(LogLevel::ERROR, "Directory ownership violation: " + path);
+        std::cerr << "Internal error: vault file access check failed.\n";
+        return false;
+    }
+    mode_t perms = st.st_mode & 0777;
+    // For directories we require no group/other access
+    if ((perms & 0077) != 0) {
+        audit_log_level(LogLevel::ERROR, "Insecure directory permissions on: " + path);
+        std::cerr << "Internal error: vault file access check failed.\n";
+        return false;
+    }
+    return true;
+#endif
+}
+
+static bool check_file_ownership_and_perms(const std::string& path, bool allow_missing) {
+#if defined(_WIN32)
+    (void)path; (void)allow_missing;
+    return true;
+#else
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        if (errno == ENOENT && allow_missing) return true;
+        std::cerr << "Internal error: vault file check failed.\n";
+        return false;
+    }
+    uid_t uid = geteuid();
+    if (st.st_uid != uid) {
+        audit_log_level(LogLevel::ERROR, "File ownership violation: " + path);
+        std::cerr << "Internal error: vault file access check failed.\n";
+        return false;
+    }
+    mode_t perms = st.st_mode & 0777;
+    if ((perms & 0077) != 0) {
+        audit_log_level(LogLevel::ERROR, "Insecure file permissions on: " + path);
+        std::cerr << "Internal error: vault file access check failed.\n";
+        return false;
+    }
+    return true;
+#endif
+}
 
 
 // ---------- Secure input (returns vector<byte> so we can wipe reliably) ----------
@@ -591,7 +727,6 @@ static bool running_in_wsl() {
 }
 // ----------------
 
-// POSIX helpers: try several available clipboard utilities
 static bool clipboard_set_posix(const std::string& data) {
     // prefer wl-copy (Wayland), then pbcopy (macOS), then xclip/xsel
     const std::vector<std::vector<const char*>> writers = {
@@ -618,7 +753,6 @@ static bool clipboard_set_posix(const std::string& data) {
 }
 
 static bool clipboard_get_posix(std::string& out) {
-
     const std::vector<std::vector<const char*>> readers = {
         { "wl-paste", "--no-newline" },
         { "pbpaste" },
@@ -690,13 +824,9 @@ static bool clipboard_clear() {
 // clipboard still contains identical content. zeroes local buffers used.
 static void copy_with_timed_clear(const std::string& secret, unsigned seconds) {
     if (secret.empty()) return;
-
-    // Copy using a controlled buffer so we can wipe it after use
     std::vector<unsigned char> buf(secret.begin(), secret.end());
-    // Attempt to set clipboard
     bool ok = false;
 #if defined(_WIN32)
-    // Win32 path: create a std::string for API call
     std::string tmp((char*)buf.data(), buf.size());
     ok = clipboard_set(tmp);
     sodium_memzero((void*)tmp.data(), tmp.size());
@@ -705,8 +835,6 @@ static void copy_with_timed_clear(const std::string& secret, unsigned seconds) {
     ok = clipboard_set(tmp);
     sodium_memzero((void*)tmp.data(), tmp.size());
 #endif
-
-    // Wipe our local vector copy
     sodium_memzero(buf.data(), buf.size());
     buf.clear();
 
@@ -715,18 +843,14 @@ static void copy_with_timed_clear(const std::string& secret, unsigned seconds) {
         return;
     }
 
-    // Spawn a detached thread to clear clipboard after timeout.
-    // The thread will re-read the clipboard and only clear if contents match what we put there.
     std::thread([secret, seconds]() {
         std::this_thread::sleep_for(std::chrono::seconds(seconds));
         std::string current;
         if (!clipboard_get(current)) {
-            // maybe already cleared or cannot read; nothing to do
             return;
         }
-        // Trim trailing newline differences
         std::string expected = secret;
-        // Compare exactly; if matches, clear
+        // compare exactly, if matches, clear
         if (current == expected) {
             clipboard_clear();
             audit_log_level(LogLevel::INFO, "Clipboard cleared after timeout");
@@ -825,6 +949,66 @@ static Vault deserialize_vault(const std::string& s) {
 }
 
 
+// ---------- Multi-vault initialization ----------
+static bool init_vault_paths_interactive() {
+    std::string home = get_user_home_dir();
+#if defined(_WIN32)
+    const char sep = '\\';
+    g_vault_root = home + "\\.passman";
+    std::string vaults_dir = g_vault_root + "\\vaults";
+#else
+    const char sep = '/';
+    g_vault_root = home + "/.passman";
+    std::string vaults_dir = g_vault_root + "/vaults";
+#endif
+    if (!ensure_dir_exists(g_vault_root, S_IRWXU)) {
+        return false;
+    }
+    if (!ensure_dir_exists(vaults_dir, S_IRWXU)) {
+        return false;
+    }
+
+    // choose vault name
+    while (true) {
+        std::cout << "Select vault name (e.g. 'default'): ";
+        if (!std::getline(std::cin, g_vault_name)) {
+            return false;
+        }
+        if (!valid_vault_name(g_vault_name)) {
+            std::cout << "Invalid vault name. Use only letters, digits, '_' or '-', max " << MAX_VAULT_NAME_LEN << " characters.\n";
+            continue;
+        }
+        break;
+    }
+
+    // build per-vault directory & paths
+    g_vault_dir = vaults_dir + sep + g_vault_name;
+    if (!ensure_dir_exists(g_vault_dir, S_IRWXU)) {
+        return false;
+    }
+#if defined(_WIN32)
+    g_vault_filename = g_vault_dir + "\\vault.bin";
+    g_meta_filename = g_vault_dir + "\\vault.meta";
+    g_audit_log_path = g_vault_dir + "\\audit.log";
+#else
+    g_vault_filename = g_vault_dir + "/vault.bin";
+    g_meta_filename = g_vault_dir + "/vault.meta";
+    g_audit_log_path = g_vault_dir + "/audit.log";
+#endif
+    // enforce per-user ownership and tight permissions on vault dir
+    if (!check_dir_ownership_and_perms(g_vault_dir)) {
+        return false;
+    }
+
+    // if files don't exist yet
+    if (!check_file_ownership_and_perms(g_vault_filename, true)) return false;
+    if (!check_file_ownership_and_perms(g_meta_filename, true)) return false;
+    if (!check_file_ownership_and_perms(g_audit_log_path, true)) return false;
+
+    return true;
+}
+
+
 // -------- Crypto helpers --------
 static bool derive_key_from_password(const byte* pw, size_t pw_len, const byte salt[SALT_LEN], byte key[KEY_LEN]) {
     if (!pw || pw_len == 0) return false;
@@ -880,7 +1064,7 @@ static bool decrypt_vault_blob(const byte key[KEY_LEN], const byte *ct, size_t c
         sodium_memzero(*out_plain, ct_len);
         free(*out_plain);
         *out_plain = nullptr;
-        audit_log_level(LogLevel::WARN, "decrypt_vault_blob: authentication failed");
+        audit_log_level(LogLevel::ERROR, "decrypt_vault_blob: authentication failed");
         return false;
     }
     *out_plain_len = (size_t)mlen;
@@ -938,7 +1122,7 @@ static bool save_meta(const byte salt[SALT_LEN], const byte nonce[NONCE_LEN]) {
     std::string b64nonce = to_base64(nonce, NONCE_LEN);
     std::string content = b64salt + "\n" + b64nonce + "\n";
     // atomic write
-    if (!atomic_write_file(META_FILENAME, reinterpret_cast<const byte*>(content.data()), content.size())) {
+    if (!atomic_write_file(g_meta_filename, reinterpret_cast<const byte*>(content.data()), content.size())) {
         audit_log_level(LogLevel::ERROR, "save_meta: atomic write failed");
         return false;
     }
@@ -947,7 +1131,7 @@ static bool save_meta(const byte salt[SALT_LEN], const byte nonce[NONCE_LEN]) {
 
 
 static bool load_meta(byte salt[SALT_LEN], byte nonce[NONCE_LEN]) {
-    FILE* f = fopen(META_FILENAME, "r");
+    FILE* f = fopen(g_meta_filename.c_str(), "r");
     if (!f) {
         audit_log_level(LogLevel::ERROR, "load_meta: fopen failed");
         return false;
@@ -990,7 +1174,7 @@ static bool load_meta(byte salt[SALT_LEN], byte nonce[NONCE_LEN]) {
 
 
 static bool load_vault_ciphertext(std::vector<byte>& ct) {
-    FILE* f = fopen(VAULT_FILENAME, "rb");
+    FILE* f = fopen(g_vault_filename.c_str(), "rb");
     if (!f) return false;
     if (fseek(f, 0, SEEK_END) != 0) {
         fclose(f);
@@ -1080,6 +1264,11 @@ static void print_menu() {
 int main() {
     init_log_context();
 
+    if (!init_vault_paths_interactive()) {
+        std::fprintf(stderr, "Failed to initialize vault paths.\n");
+        return 1;
+    }
+
     if (sodium_init() < 0) {
         std::fprintf(stderr, "An unexpected error occurred. Check audit log for details.\n");
         audit_log_level(LogLevel::ERROR, "libsodium init failed");
@@ -1094,8 +1283,7 @@ int main() {
     sodium_memzero(nonce, NONCE_LEN);
 
     // Check if vault exists; if not, run init
-    bool vault_exists = (access(VAULT_FILENAME, F_OK) == 0 && access(META_FILENAME, F_OK) == 0);
-
+    bool vault_exists = (access(g_vault_filename.c_str(), F_OK) == 0 && access(g_meta_filename.c_str(), F_OK) == 0);
     if (!vault_exists) {
         std::cout << "No vault found. Initialize new vault.\n";
         // generate salt and ask master password twice
@@ -1136,7 +1324,7 @@ int main() {
             sodium_memzero(pw1.data(), pw1.size()); sodium_memzero(pw2.data(), pw2.size());
             return cleanup_and_exit(3, vault, key, salt, nonce);
         }
-        if (!atomic_write_file(VAULT_FILENAME, ct, ct_len) || !save_meta(salt, new_nonce)) {
+        if (!atomic_write_file(g_vault_filename, ct, ct_len) || !save_meta(salt, new_nonce)) {
             audit_log_level(LogLevel::ERROR, "Vault init: saving vault/meta failed");
             std::cerr << "An unexpected error occurred. Check audit log.\n";
             sodium_memzero(ct, ct_len);
@@ -1150,8 +1338,16 @@ int main() {
         sodium_memzero(pw2.data(), pw2.size());
         sodium_memzero(key, KEY_LEN);
         std::cout << "Vault initialized. Restart to open.\n";
+        std::cerr << g_vault_filename + "\n";
         audit_log_level(LogLevel::INFO, "New vault initialized");
         return 0;
+    }
+
+    // For existing vaults, re-check per-user ownership on files
+    if (!check_file_ownership_and_perms(g_vault_filename, false) ||
+        !check_file_ownership_and_perms(g_meta_filename, false)) {
+        std::cerr << "Vault files do not meet security requirements.\n";
+        return cleanup_and_exit(2, vault, key, salt, nonce);
     }
 
     // Loading metadata
@@ -1580,10 +1776,9 @@ int main() {
             sodium_memzero(salt, SALT_LEN);
             sodium_memzero(nonce, NONCE_LEN);
 
-            secure_delete_file(VAULT_FILENAME);
-            secure_delete_file(META_FILENAME);
-
-            audit_log_level(LogLevel::ALERT, "Vault deleted by user request and memory cleared");
+            secure_delete_file(g_vault_filename.c_str());
+            secure_delete_file(g_meta_filename.c_str());
+            secure_delete_file(g_audit_log_path.c_str());
 
             std::cout << "Vault deleted.\n";
             running = false;
