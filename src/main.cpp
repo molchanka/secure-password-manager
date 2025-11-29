@@ -14,7 +14,7 @@
 // ---------------- Inactivity timer implementation ----------------
 static std::atomic<bool> g_reset_timer{ false };
 static std::atomic<bool> g_timer_running{ true };
-constexpr int INACTIVITY_LIMIT = 15; // seconds
+constexpr int INACTIVITY_LIMIT = 60; // seconds
 
 static void start_inactivity_timer(std::function<void()> on_timeout) {
     std::thread([on_timeout]() {
