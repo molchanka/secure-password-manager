@@ -1,6 +1,6 @@
 # secure-password-manager
 
-Secure password manager for personal use, written using C++ and secured using various practices learned thoughout the TalTech's Secure Programming course.
+Secure password manager for personal use, written using C++ and secured using various practices learned thoughout the Secure Programming course.
 
 ## Current features
 
@@ -8,7 +8,8 @@ Secure password manager for personal use, written using C++ and secured using va
 - XChaCha20-Poly1305 authenticated encryption for all vault data
 - AEAD authentication (via Poly1305) provides integrity for all vault data
 - Cross-platform clipboard integration (timed clear)
-
+- Session timeout auto-lock
+- Multi-vault support
 
 ### Workflow
 
@@ -26,13 +27,11 @@ Secure password manager for personal use, written using C++ and secured using va
 | Update | Requires old password, validates, securely overwrites, creates a log entry |
 | Delete | Requires master password, removes the credential, creates a log entry |
 | Reveal | Displays credential, creates a log entry |
-| Copy | Copies credential into a secure buffer that is locked in RAM and wiped on demand or to system clipboard with necessary warnings |
+| Copy | Copies credential to system clipboard |
 
 ### Future roadmap
 
-- SHA-256 for log integrity checks
-- Session timeout auto-lock
-- Multi-vault support
+- Log integrity checks
 - Testing on native Windows
 
 ## Dependencies
@@ -76,10 +75,8 @@ This is a learning-based implementation, not a production password manager. It d
 
 ## Build instructions
 
-### Using g++
-
 ```
-g++ -std=c++17 -O2 -Wall passman.cpp -lsodium -o passman
+make
 ```
 
 ### Run
