@@ -54,39 +54,33 @@ bool load_vault_decrypted(const byte key[KEY_LEN],
         return false;
     }
 
-    if (!plain || plain_len == 0) {
-        audit_log_level(LogLevel::WARN,
-            "load_vault_decrypted: empty plaintext after decrypt",
-            "load_vault",
-            "failure");
-        if (plain) {
+    std::string txt;
+    if (plain_len > 0) {
+        try {
+            txt.assign(reinterpret_cast<char*>(plain), plain_len);
+        }
+        catch (...) {
+            audit_log_level(LogLevel::ERROR,
+                "load_vault_decrypted: std::string allocation failed",
+                "load_vault",
+                "failure");
             sodium_memzero(plain, plain_len);
             free(plain);
+            return false;
         }
-        return false;
-    }
-
-    std::string txt;
-    try {
-        txt.assign(reinterpret_cast<char*>(plain), plain_len);
-    }
-    catch (...) {
-        audit_log_level(LogLevel::ERROR,
-            "load_vault_decrypted: std::string allocation failed",
-            "load_vault",
-            "failure");
-        sodium_memzero(plain, plain_len);
-        free(plain);
-        return false;
     }
 
     // wipe and free raw plaintext buffer
     sodium_memzero(plain, plain_len);
     free(plain);
 
-    out = deserialize_vault(txt);
     if (!txt.empty()) {
+        out = deserialize_vault(txt);
         sodium_memzero(&txt[0], txt.size());
+    }
+    else {
+        // empty plaintext => empty vault
+        out.clear();
     }
 
     return true;
@@ -188,13 +182,6 @@ int main() {
     byte key[KEY_LEN];      sodium_memzero(key, KEY_LEN);
     byte nonce[NONCE_LEN];  sodium_memzero(nonce, NONCE_LEN);
 
-    auto secure_exit = [&](int code) {
-        sodium_memzero(key, KEY_LEN);
-        sodium_memzero(salt, SALT_LEN);
-        sodium_memzero(nonce, NONCE_LEN);
-        return code;
-        };
-
     // ---------------- Vault initialization (first run) ----------------
     bool vault_exists =
         (access(g_vault_filename.c_str(), F_OK) == 0 &&
@@ -222,7 +209,7 @@ int main() {
             std::cerr << "Master password cannot be empty or whitespace.\n";
             if (!pw1.empty()) sodium_memzero(pw1.data(), pw1.size());
             if (!pw2.empty()) sodium_memzero(pw2.data(), pw2.size());
-            return secure_exit(2);
+            return cleanup_and_exit(2, key, salt, nonce);
         }
 
         if (pw1 != pw2) {
@@ -233,7 +220,7 @@ int main() {
             std::cerr << "Passwords do not match. Exiting.\n";
             if (!pw1.empty()) sodium_memzero(pw1.data(), pw1.size());
             if (!pw2.empty()) sodium_memzero(pw2.data(), pw2.size());
-            return secure_exit(2);
+            return cleanup_and_exit(2, key, salt, nonce);
         }
 
         if (!derive_key_from_password(pw1.data(), pw1.size(), salt, key)) {
@@ -244,7 +231,7 @@ int main() {
             std::cerr << "An unexpected error occurred. Check audit log.\n";
             if (!pw1.empty()) sodium_memzero(pw1.data(), pw1.size());
             if (!pw2.empty()) sodium_memzero(pw2.data(), pw2.size());
-            return secure_exit(2);
+            return cleanup_and_exit(2, key, salt, nonce);
         }
 
         Vault empty_vault;
@@ -252,7 +239,7 @@ int main() {
             std::cerr << "An unexpected error occurred. Check audit log.\n";
             if (!pw1.empty()) sodium_memzero(pw1.data(), pw1.size());
             if (!pw2.empty()) sodium_memzero(pw2.data(), pw2.size());
-            return secure_exit(3);
+            return cleanup_and_exit(3, key, salt, nonce);
         }
 
         if (!pw1.empty()) sodium_memzero(pw1.data(), pw1.size());
@@ -265,7 +252,7 @@ int main() {
             "success");
 
         std::cout << "Vault initialized. Restart to open.\n";
-        return secure_exit(0);
+        return cleanup_and_exit(0, key, salt, nonce);
     }
 
     // ---------------- Existing vault: ownership & metadata ----------------
@@ -276,7 +263,7 @@ int main() {
             "Vault file permissions/ownership invalid",
             "session",
             "failure");
-        return secure_exit(2);
+        return cleanup_and_exit(2, key, salt, nonce);
     }
 
     if (!load_meta(salt, nonce)) {
@@ -285,7 +272,7 @@ int main() {
             "Failed to load vault metadata",
             "load_metadata",
             "failure");
-        return secure_exit(2);
+        return cleanup_and_exit(2, key, salt, nonce);
     }
 
     // ---------------- Master password unlock ----------------
@@ -352,12 +339,12 @@ int main() {
             "Too many failed master password attempts - lockout",
             "load_vault",
             "failure");
-        return secure_exit(3);
+        return cleanup_and_exit(3, key, salt, nonce);
     }
 
     // ---------------- Start inactivity timer ----------------
-    g_reset_timer = true;
     g_timer_running = true;
+    g_reset_timer = true;
 
     start_inactivity_timer([&]() {
         std::cout << "\n[!] Logged out due to inactivity.\n";
@@ -371,6 +358,7 @@ int main() {
         close(STDIN_FILENO); // break getline()
 #endif
         g_timer_running = false;
+        return cleanup_and_exit(0, key, salt, nonce);
         });
 
     // ---------------- Main CLI loop ----------------
@@ -762,20 +750,14 @@ int main() {
                 continue;
             }
 
-            if (!clipboard_copy_timed(it->second.password, 15)) {
-                std::cout << "Failed to copy password to clipboard.\n";
-                audit_log_level(LogLevel::WARN,
-                    "Clipboard copy failed for: " + label,
-                    "clip_cred",
-                    "failure");
-            }
-            else {
-                std::cout << "Password copied to clipboard for 15 seconds.\n";
-                audit_log_level(LogLevel::INFO,
-                    "Clipboard copy success for: " + label,
-                    "clip_cred",
-                    "success");
-            }
+            copy_with_timed_clear(it->second.password, 15);
+
+            std::cout << "Password copied to clipboard for 15 seconds.\n";
+
+            audit_log_level(LogLevel::INFO,
+                "Clipboard copy success for: " + label,
+                "clip_cred",
+                "success");
 
             secure_clear_vault(v);
         }
@@ -871,5 +853,5 @@ int main() {
         "session",
         "success");
 
-    return secure_exit(0);
+    return cleanup_and_exit(2, key, salt, nonce);
 }
