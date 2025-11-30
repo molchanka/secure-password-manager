@@ -179,6 +179,7 @@ void print_menu() {
     clear_screen();
     std::cout << "\n";
     std::cout << "Password Manager CLI - Menu:\n";
+    std::cout << "\n";
     std::cout << "1) List credentials\n";
     std::cout << "2) Add credential (+New)\n";
     std::cout << "3) Update credential\n";
@@ -187,5 +188,7 @@ void print_menu() {
     std::cout << "6) Copy credential\n";
     std::cout << "7) Quit\n";
     std::cout << "8) Delete current vault\n";
+    std::cout << "\n";
+    std::cout << "Scroll up to see previous operation results.\n";
     g_reset_timer = true;
 }
