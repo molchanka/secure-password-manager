@@ -120,7 +120,7 @@ bool check_dir_ownership_and_perms(const std::string& path) {
             "failure");
         std::cerr << "Internal error: vault file access check failed.\n";
         return false;
-}
+    }
     return true;
 #endif
 }
@@ -161,7 +161,7 @@ bool check_file_ownership_and_perms(const std::string& path, bool allow_missing)
 
 
 // ---------- Multi-vault initialization ----------
-bool init_vault_paths_interactive() {
+bool init_vault_paths() {
     std::string home = get_user_home_dir();
 #if defined(_WIN32)
     const char sep = '\\';
