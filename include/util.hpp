@@ -1,6 +1,7 @@
 #pragma once
 #include "passman_common.hpp"
 #include "logging.hpp"
+#include "secure_buffer.hpp"
 
 #include <atomic>
 #include <thread>
@@ -19,12 +20,11 @@ bool valid_password(const std::string& s);
 bool valid_vault_name(const std::string& v);
 
 // ---------- Secure input ----------
-std::vector<byte> get_password_bytes(const char* prompt);
+SecureBuffer get_password_secure(const char* prompt);
 
 // ---------- Centralized cleanup & exit ----------
 int cleanup_and_exit(
     int code,
-    unsigned char key[KEY_LEN],
     unsigned char salt[SALT_LEN],
     unsigned char nonce[NONCE_LEN]
 );

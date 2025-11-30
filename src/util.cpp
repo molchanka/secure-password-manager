@@ -1,5 +1,6 @@
 #include "util.hpp"
 #include "vault.hpp"
+#include "secure_buffer.hpp"
 
 #if !defined(_WIN32)
 #include <sys/ioctl.h>
@@ -63,36 +64,45 @@ bool valid_vault_name(const std::string& s) {
 }
 
 // ---------- Secure input ----------
-static void disable_echo(bool disable) {
-#if !defined(_WIN32)
-    termios tty;
-    if (tcgetattr(STDIN_FILENO, &tty) != 0) return;
+//static void disable_echo(bool disable) {
+//#if !defined(_WIN32)
+//    termios tty;
+//    if (tcgetattr(STDIN_FILENO, &tty) != 0) return;
+//
+//    if (disable) tty.c_lflag &= ~ECHO;
+//    else         tty.c_lflag |= ECHO;
+//
+//    tcsetattr(STDIN_FILENO, TCSANOW, &tty);
+//#endif
+//}
 
-    if (disable) tty.c_lflag &= ~ECHO;
-    else         tty.c_lflag |= ECHO;
+//std::vector<byte> get_password_bytes(const char* prompt) {
+SecureBuffer get_password_secure(const char* prompt)
+{
+    std::string input;
 
-    tcsetattr(STDIN_FILENO, TCSANOW, &tty);
-#endif
-}
+    // disable echo
+    struct termios oldt, newt;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~ECHO;
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 
-std::vector<byte> get_password_bytes(const char* prompt) {
     std::cout << prompt;
-    std::fflush(stdout);
-
-    disable_echo(true);
-
-    std::string s;
-    std::getline(std::cin, s);
-
-    disable_echo(false);
+    std::getline(std::cin, input);
     std::cout << "\n";
 
-    std::vector<byte> out(s.begin(), s.end());
-    if (!s.empty()) {
-        volatile char* p = &s[0];
-        std::fill(p, p + s.size(), 0);
-    }
-    return out;
+    // restore echo
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+
+    // allocate secure buffer
+    SecureBuffer buf(input.size());
+    std::memcpy(buf.data(), input.data(), input.size());
+
+    // wipe temporary input immediately
+    sodium_memzero(input.data(), input.size());
+
+    return buf;
 }
 
 // ---------- Vault memory cleanup ----------
@@ -108,12 +118,9 @@ void secure_clear_vault(Vault& v) {
 // ---------- Centralized cleanup & exit ----------
 int cleanup_and_exit(
     int code,
-    byte key[KEY_LEN],
     byte salt[SALT_LEN],
     byte nonce[NONCE_LEN]
 ) {
-
-    sodium_memzero(key, KEY_LEN);
     sodium_memzero(salt, SALT_LEN);
     sodium_memzero(nonce, NONCE_LEN);
 
