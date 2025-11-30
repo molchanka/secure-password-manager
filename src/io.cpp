@@ -184,7 +184,7 @@ bool init_vault_paths_interactive() {
     unsigned attempts = 0;
     const unsigned MAX_ATTEMPTS = 5;
     while (attempts < MAX_ATTEMPTS) {
-        std::cout << "Select vault name (e.g. 'default'): ";
+        std::cout << "Vault name: ";
         if (!std::getline(std::cin, g_vault_name)) {
             return false;
         }

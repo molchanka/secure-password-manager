@@ -55,7 +55,7 @@ bool valid_password(const std::string& s) {
     return !contains_control_or_tab_or_null(s);
 }
 
-bool valid_vault_name(const std::string& v) {
+bool valid_vault_name(const std::string& s) {
     if (s.empty() || s.size() > MAX_VAULT_NAME_LEN) return false;
     return std::all_of(s.begin(), s.end(), [](unsigned char c) {
         return std::isalnum(c) || c == '_' || c == '-'; // allow alnum, '_', '-'
@@ -108,12 +108,10 @@ void secure_clear_vault(Vault& v) {
 // ---------- Centralized cleanup & exit ----------
 int cleanup_and_exit(
     int code,
-    Vault& vault,
     byte key[KEY_LEN],
     byte salt[SALT_LEN],
     byte nonce[NONCE_LEN]
 ) {
-    secure_clear_vault(vault);
 
     sodium_memzero(key, KEY_LEN);
     sodium_memzero(salt, SALT_LEN);
@@ -173,13 +171,14 @@ void clear_screen() {
 void print_menu() {
     clear_screen();
     std::cout << "\n";
-    std::cout << "SecurePass CLI - Menu:\n";
+    std::cout << "Password Manager CLI - Menu:\n";
     std::cout << "1) List credentials\n";
     std::cout << "2) Add credential (+New)\n";
     std::cout << "3) Update credential\n";
     std::cout << "4) Delete credential\n";
     std::cout << "5) Reveal credential (logs action)\n";
-    std::cout << "6) Copy credential to secure buffer\n";
+    std::cout << "6) Copy credential\n";
     std::cout << "7) Quit\n";
     std::cout << "8) Delete current vault\n";
+    g_reset_timer = true;
 }

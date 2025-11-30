@@ -24,7 +24,6 @@ std::vector<byte> get_password_bytes(const char* prompt);
 // ---------- Centralized cleanup & exit ----------
 int cleanup_and_exit(
     int code,
-    Vault& vault,
     unsigned char key[KEY_LEN],
     unsigned char salt[SALT_LEN],
     unsigned char nonce[NONCE_LEN]

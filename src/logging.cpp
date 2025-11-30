@@ -99,6 +99,10 @@ void audit_log_level(
         return;
     }
 
+#if !defined(_WIN32)
+    fchmod(fileno(f), S_IRUSR | S_IWUSR);
+#endif
+
     // timestamp
     std::time_t t = std::time(nullptr);
     std::tm tm{};

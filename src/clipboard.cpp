@@ -190,8 +190,8 @@ bool windows_clipboard_history_enabled() {
     }
 
     return (value == 1);
-}
 #endif
+}
 
 bool clipboard_set(const std::string& data) {
 #if defined(_WIN32)
