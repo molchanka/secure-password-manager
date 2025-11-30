@@ -7,6 +7,11 @@
 #include <termios.h>
 #endif
 
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <functional>
+
 // ---------- SessionID ----------
 std::string generate_session_id() {
     unsigned char buf[16];
@@ -122,6 +127,27 @@ int cleanup_and_exit(int code, Vault& vault, unsigned char key[KEY_LEN],
 
     audit_log_level(LogLevel::INFO, std::string("Session closed with code ") + std::to_string(code), "util_module", "notify");
     return code;
+}
+
+// ---------------- Inactivity timer implementation ----------------
+void start_inactivity_timer(std::function<void()> on_timeout) {
+    std::thread([on_timeout]() {
+        int remaining = INACTIVITY_LIMIT;
+        while (g_timer_running.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            if (g_reset_timer.exchange(false)) {
+                remaining = INACTIVITY_LIMIT;
+            }
+            else {
+                remaining--;
+                if (remaining <= 0) {
+                    on_timeout();
+                    return;
+                }
+            }
+        }
+        }).detach();
 }
 
 // ---------- Program flow helpers ----------

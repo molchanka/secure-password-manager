@@ -2,6 +2,11 @@
 #include "passman_common.hpp"
 #include "logging.hpp"
 
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <functional>
+
 // ---------- SessionID ----------
 std::string generate_session_id();
 
@@ -29,3 +34,9 @@ void secure_clear_vault(Vault& v);
 // ---------- Menu ----------
 void clear_screen();
 void print_menu();
+
+// ---------- Timer ----------
+static std::atomic<bool> g_reset_timer{ false };
+static std::atomic<bool> g_timer_running{ true };
+constexpr int INACTIVITY_LIMIT = 60; // seconds
+void start_inactivity_timer(std::function<void()> on_timeout);
