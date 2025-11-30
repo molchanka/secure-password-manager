@@ -1,5 +1,6 @@
 #include "util.hpp"
 #include "vault.hpp"
+#include "secure_buffer.hpp"
 
 #if !defined(_WIN32)
 #include <sys/ioctl.h>
@@ -7,22 +8,28 @@
 #include <termios.h>
 #endif
 
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <functional>
+
+
 // ---------- SessionID ----------
 std::string generate_session_id() {
-    unsigned char buf[16];
-    std::random_device rd;
-    for (std::size_t i = 0; i < sizeof(buf); ++i) {
-        buf[i] = static_cast<unsigned char>(rd());
-    }
+    std::array<byte, 16> buf{};
+    randombytes_buf(buf.data(), buf.size());
+
     static const char* hex = "0123456789abcdef";
-    char out[33];
-    out[32] = '\0';
-    for (std::size_t i = 0; i < sizeof(buf); ++i) {
+    std::string out;
+    out.resize(32);
+
+    for (size_t i = 0; i < buf.size(); ++i) {
         out[2 * i] = hex[(buf[i] >> 4) & 0x0F];
         out[2 * i + 1] = hex[buf[i] & 0x0F];
     }
-    return std::string(out);
+    return out;
 }
+
 
 // ---------- Helpers: input validation ----------
 bool contains_control_or_tab_or_null(const std::string& s) {
@@ -37,6 +44,7 @@ bool valid_label_or_username(const std::string& s) {
     if (s.empty()) return false;
     if (s.size() > MAX_LABEL_LEN) return false;
     if (contains_control_or_tab_or_null(s)) return false;
+
     // disallow whitespace-only
     if (std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c); })) return false;
     return true;
@@ -45,54 +53,56 @@ bool valid_label_or_username(const std::string& s) {
 bool valid_password(const std::string& s) {
     if (s.empty()) return false;
     if (s.size() > MAX_PASS_LEN) return false;
-    if (contains_control_or_tab_or_null(s)) return false;
-    return true;
+    return !contains_control_or_tab_or_null(s);
 }
 
-bool valid_vault_name(const std::string& v) {
-    if (v.empty()) return false;
-    if (v.size() > MAX_VAULT_NAME_LEN) return false;
-    for (unsigned char c : v) {
-        if (!(std::isalnum(c) || c == '_' || c == '-')) { // allow alnum, '_', '-'
-            return false;
-        }
-    }
-    return true;
+bool valid_vault_name(const std::string& s) {
+    if (s.empty() || s.size() > MAX_VAULT_NAME_LEN) return false;
+    return std::all_of(s.begin(), s.end(), [](unsigned char c) {
+        return std::isalnum(c) || c == '_' || c == '-'; // allow alnum, '_', '-'
+    });
 }
 
-// ---------- Secure input (returns vector<byte> so we can wipe reliably) ----------
-std::vector<byte> get_password_bytes(const char* prompt) {
-    std::vector<byte> rv;
-    std::cout << prompt;
-    std::fflush(stdout);
-    if (!isatty(STDIN_FILENO)) {
-        std::string tmp;
-        if (!std::getline(std::cin, tmp)) return rv;
-        rv.assign(tmp.begin(), tmp.end());
-        return rv;
-    }
+// ---------- Secure input ----------
+//static void disable_echo(bool disable) {
+//#if !defined(_WIN32)
+//    termios tty;
+//    if (tcgetattr(STDIN_FILENO, &tty) != 0) return;
+//
+//    if (disable) tty.c_lflag &= ~ECHO;
+//    else         tty.c_lflag |= ECHO;
+//
+//    tcsetattr(STDIN_FILENO, TCSANOW, &tty);
+//#endif
+//}
+
+//std::vector<byte> get_password_bytes(const char* prompt) {
+SecureBuffer get_password_secure(const char* prompt)
+{
+    std::string input;
+
+    // disable echo
     struct termios oldt, newt;
-    if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
-        // fallback
-        std::string tmp;
-        if (!std::getline(std::cin, tmp)) return rv;
-        rv.assign(tmp.begin(), tmp.end());
-        return rv;
-    }
+    tcgetattr(STDIN_FILENO, &oldt);
     newt = oldt;
     newt.c_lflag &= ~ECHO;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) != 0) {
-        // fallback - log but do not expose
-        audit_log_level(LogLevel::WARN, "tcsetattr failed while disabling echo", "util_module", "failure");
-    }
-    std::string tmp;
-    std::getline(std::cin, tmp);
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &oldt) != 0) {
-        audit_log_level(LogLevel::WARN, "tcsetattr failed while restoring attrs", "util_module", "failure");
-    }
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+    std::cout << prompt;
+    std::getline(std::cin, input);
     std::cout << "\n";
-    rv.assign(tmp.begin(), tmp.end());
-    return rv;
+
+    // restore echo
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+
+    // allocate secure buffer
+    SecureBuffer buf(input.size());
+    std::memcpy(buf.data(), input.data(), input.size());
+
+    // wipe temporary input immediately
+    sodium_memzero(input.data(), input.size());
+
+    return buf;
 }
 
 // ---------- Vault memory cleanup ----------
@@ -106,42 +116,61 @@ void secure_clear_vault(Vault& v) {
 }
 
 // ---------- Centralized cleanup & exit ----------
-int cleanup_and_exit(int code, Vault& vault, unsigned char key[KEY_LEN],
-    unsigned char salt[SALT_LEN], unsigned char nonce[NONCE_LEN]) {
-    // wipe vault entries
-    for (auto& p : vault) {
-        if (!p.second.username.empty()) sodium_memzero(&p.second.username[0], p.second.username.size());
-        if (!p.second.password.empty()) sodium_memzero(&p.second.password[0], p.second.password.size());
-        if (!p.second.notes.empty()) sodium_memzero(&p.second.notes[0], p.second.notes.size());
-    }
-    vault.clear();
-
-    sodium_memzero(key, KEY_LEN);
+int cleanup_and_exit(
+    int code,
+    byte salt[SALT_LEN],
+    byte nonce[NONCE_LEN]
+) {
     sodium_memzero(salt, SALT_LEN);
     sodium_memzero(nonce, NONCE_LEN);
 
-    audit_log_level(LogLevel::INFO, std::string("Session closed with code ") + std::to_string(code), "util_module", "notify");
+    audit_log_level(LogLevel::INFO,
+        "Session closed with code " + std::to_string(code),
+        "util_module",
+        "notify");
+
     return code;
+}
+
+// ---------------- Inactivity timer implementation ----------------
+void start_inactivity_timer(std::function<void()> on_timeout) {
+    std::thread([on_timeout]() {
+        int remaining = INACTIVITY_LIMIT;
+        while (g_timer_running.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            if (g_reset_timer.exchange(false)) {
+                remaining = INACTIVITY_LIMIT;
+            }
+            else {
+                remaining--;
+                if (remaining <= 0) {
+                    on_timeout();
+                    return;
+                }
+            }
+        }
+        }).detach();
 }
 
 // ---------- Program flow helpers ----------
 void clear_screen() {
 #if defined(_WIN32)
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    DWORD cellCount, count;
-    COORD homeCoords = { 0, 0 };
-
     if (hOut == INVALID_HANDLE_VALUE) return;
 
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
     if (!GetConsoleScreenBufferInfo(hOut, &csbi)) return;
-    cellCount = csbi.dwSize.X * csbi.dwSize.Y;
 
-    FillConsoleOutputCharacter(hOut, ' ', cellCount, homeCoords, &count);
-    FillConsoleOutputAttribute(hOut, csbi.wAttributes, cellCount, homeCoords, &count);
-    SetConsoleCursorPosition(hOut, homeCoords);
+    DWORD cellCount = csbi.dwSize.X * csbi.dwSize.Y;
+    DWORD count;
+    COORD home = { 0,0 };
+
+    FillConsoleOutputCharacter(hOut, ' ', cellCount, home, &count);
+    FillConsoleOutputAttribute(hOut, csbi.wAttributes, cellCount, home, &count);
+    SetConsoleCursorPosition(hOut, home);
 #else
-    // secure erase (visible + scrollback)
+    // Clear visible screen and scrollback buffer
     std::cout << "\033[3J\033[2J\033[H";
 #endif
 }
@@ -149,13 +178,17 @@ void clear_screen() {
 void print_menu() {
     clear_screen();
     std::cout << "\n";
-    std::cout << "SecurePass CLI - Menu:\n";
+    std::cout << "Password Manager CLI - Menu:\n";
+    std::cout << "\n";
     std::cout << "1) List credentials\n";
     std::cout << "2) Add credential (+New)\n";
     std::cout << "3) Update credential\n";
     std::cout << "4) Delete credential\n";
     std::cout << "5) Reveal credential (logs action)\n";
-    std::cout << "6) Copy credential to secure buffer\n";
+    std::cout << "6) Copy credential\n";
     std::cout << "7) Quit\n";
     std::cout << "8) Delete current vault\n";
+    std::cout << "\n";
+    std::cout << "Scroll up to see previous operation results.\n";
+    g_reset_timer = true;
 }

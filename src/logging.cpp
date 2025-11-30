@@ -1,10 +1,12 @@
 #include "clipboard.hpp"
 #include "logging.hpp"
 #include "io.hpp"
-#include "util.hpp" // for generate_session_id if needed
+#include "util.hpp"
 
 LogContext g_log_ctx;
 
+
+// ---------------- Get username ----------------
 static std::string get_system_username() {
 #if defined(_WIN32)
     char buf[256];
@@ -18,7 +20,6 @@ static std::string get_system_username() {
     }
     return "unknown";
 #else
-    // Use effective UID to handle sudo / different users correctly
     uid_t uid = geteuid();
     struct passwd* pw = getpwuid(uid);
     if (pw && pw->pw_name) {
@@ -32,113 +33,121 @@ static std::string get_system_username() {
 #endif
 }
 
-// Detect client IP based on SSH env, else fallback to localhost
+
+// ---------------- Get IP - client IP if SSH, else localhost ----------------
 static std::string get_client_ip() {
     const char* ssh_conn = std::getenv("SSH_CONNECTION");
     if (ssh_conn && ssh_conn[0]) {
-        // SSH_CONNECTION="client_ip client_port server_ip server_port"
         std::istringstream iss(ssh_conn);
         std::string ip;
         if (iss >> ip) {
             return ip;
         }
     }
+
     const char* ssh_client = std::getenv("SSH_CLIENT");
     if (ssh_client && ssh_client[0]) {
-        // SSH_CLIENT="client_ip client_port local_port"
         std::istringstream iss(ssh_client);
         std::string ip;
         if (iss >> ip) {
             return ip;
         }
     }
-    // Local execution (no SSH)
+
+    // local execution
     return "127.0.0.1";
 }
 
-// Initialize global logging context (userId, sessionId, IP)
+
+// ---------------- Global logging context init ----------------
 void init_log_context() {
     g_log_ctx.userId = get_system_username();
     g_log_ctx.sessionId = generate_session_id();
     g_log_ctx.ip = get_client_ip();
 }
 
-void audit_log_level(LogLevel lvl, const std::string& entry,
-    const std::string& event, const std::string& outcome)
+
+// ---------------- Logging (levels) ----------------
+static const char* log_level_str(LogLevel lvl) {
+    switch (lvl) {
+    case LogLevel::INFO:  return "INFO";
+    case LogLevel::WARN:  return "WARN";
+    case LogLevel::ERROR: return "ERROR";
+    case LogLevel::ALERT: return "ALERT";
+    default:              return "UNKNOWN";
+    }
+}
+
+void audit_log_level(
+    LogLevel lvl,
+    const std::string& entry,
+    const std::string& event,
+    const std::string& outcome
+)
 {
-    const char* path = nullptr;
-    static const char* default_log = "audit.log";
-    path = (!g_audit_log_path.empty() ? g_audit_log_path.c_str() : default_log);
+    // determine log path
+    const char* default_log = AUDIT_LOG;
+    const char* path = (!g_audit_log_path.empty()
+        ? g_audit_log_path.c_str()
+        : default_log);
 
-    int flags = O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC;
-#ifdef _WIN32
-    flags |= O_BINARY;
-#endif
-
-    int fd = open(path, flags, S_IRUSR | S_IWUSR);
-    if (fd < 0) {
-        std::cerr << "Open audit log failed.\n";
+    FILE* f = std::fopen(path, "a");
+    if (!f) {
+        std::fprintf(stderr, "[audit-fail] %s: %s\n",
+            log_level_str(lvl),
+            entry.c_str());
         return;
     }
 
-    time_t t = time(nullptr);
-    char tbuf[64];
-    struct tm tmv;
-    localtime_r(&t, &tmv);
-    strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tmv);
-
-    const char* lname = "INFO";
-    switch (lvl) {
-    case LogLevel::INFO:  lname = "INFO"; break;
-    case LogLevel::WARN:  lname = "WARN"; break;
-    case LogLevel::ERROR: lname = "ERROR"; break;
-    case LogLevel::ALERT: lname = "ALERT"; break;
-    }
-
-    // username
-    std::string username;
-#if defined(_WIN32)
-    {
-        char buf[256]; DWORD sz = sizeof(buf);
-        username = (GetUserNameA(buf, &sz) ? buf : "unknown");
-    }
-#else
-    {
-        const char* u = getenv("USER");
-        if (!u) u = getenv("LOGNAME");
-        username = (u ? u : "unknown");
-    }
+#if !defined(_WIN32)
+    fchmod(fileno(f), S_IRUSR | S_IWUSR);
 #endif
 
-    std::string sessionId = std::to_string((long long)getpid());
+    // timestamp
+    std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
 
-    // determine IP (SSH)
-    std::string ip = "127.0.0.1";
-    if (const char* ssh_conn = getenv("SSH_CONNECTION")) {
-        std::istringstream iss(ssh_conn);
-        iss >> ip;
+    char tbuf[64];
+    if (std::strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tm) == 0) {
+        std::strncpy(tbuf, "0000-00-00 00:00:00", sizeof(tbuf));
+        tbuf[sizeof(tbuf) - 1] = '\0';
     }
-    else if (const char* ssh_client = getenv("SSH_CLIENT")) {
-        std::istringstream iss(ssh_client);
-        iss >> ip;
-    }
 
-    std::ostringstream oss;
-    oss << tbuf
-        << " [" << lname << "] "
-        << "event=" << (event.empty() ? "none" : event)
-        << " userId=" << username
-        << " sessionId=" << sessionId
-        << " ip=" << ip
-        << " outcome=" << (outcome.empty() ? "none" : outcome)
-        << " desc=" << (entry.empty() ? "none" : entry)
-        << "\n";
+    // sanitize message fields to avoid newlines in log entries
+    auto sanitize = [](const std::string& s) {
+        std::string r = s;
+        for (char& c : r) {
+            if (c == '\n' || c == '\r') c = ' ';
+        }
+        return r;
+        };
 
-    std::string msg = oss.str();
+    std::string s_entry = sanitize(entry);
+    std::string s_event = sanitize(event);
+    std::string s_outcome = sanitize(outcome);
 
-    if (write(fd, msg.c_str(), msg.size()) < 0)
-        std::cerr << "Write audit log failed.\n";
+    // timestamp | level | user | ip | session | event | outcome | message
+    std::fprintf(
+        f,
+        "%s | %s | user=%s | ip=%s | session=%s | event=%s | outcome=%s | %s\n",
+        tbuf,
+        log_level_str(lvl),
+        g_log_ctx.userId.c_str(),
+        g_log_ctx.ip.c_str(),
+        g_log_ctx.sessionId.c_str(),
+        s_event.c_str(),
+        s_outcome.c_str(),
+        s_entry.c_str()
+    );
 
-    if (close(fd) != 0)
-        std::cerr << "Close audit log failed.\n";
+    std::fflush(f);
+#if !defined(_WIN32)
+    fsync(fileno(f));
+#endif
+    std::fclose(f);
 }
