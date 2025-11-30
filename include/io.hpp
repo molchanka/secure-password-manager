@@ -19,7 +19,7 @@ bool check_dir_ownership_and_perms(const std::string& path);
 bool check_file_ownership_and_perms(const std::string& path, bool allow_missing);
 
 // ---------- Multi-vault initialization ----------
-bool init_vault_paths_interactive();
+bool init_vault_paths();
 
 // -------- Atomic file write helper --------
 bool atomic_write_file(const std::string& path, const byte* buf, size_t len);

@@ -23,11 +23,10 @@ public:
         sodium_memzero(ptr_, size_);
     }
 
-    // Non-copyable
+    // non-copyable
     SecureBuffer(const SecureBuffer&) = delete;
     SecureBuffer& operator=(const SecureBuffer&) = delete;
 
-    // Movable
     SecureBuffer(SecureBuffer&& other) noexcept
         : ptr_(other.ptr_), size_(other.size_)
     {

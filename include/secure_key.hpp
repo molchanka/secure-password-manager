@@ -10,12 +10,12 @@ public:
     {
         ptr_ = static_cast<unsigned char*>(sodium_malloc(size_));
         if (!ptr_) {
-            throw std::runtime_error("sodium_malloc failed for SecureKey");
+            throw std::runtime_error("SecureKey: sodium_malloc failed");
         }
 
         if (sodium_mlock(ptr_, size_) != 0) {
             sodium_free(ptr_);
-            throw std::runtime_error("sodium_mlock failed for SecureKey");
+            throw std::runtime_error("SecureKey: sodium_mlock failed");
         }
 
         sodium_mprotect_readwrite(ptr_);
