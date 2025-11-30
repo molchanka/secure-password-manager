@@ -1,149 +1,165 @@
 ﻿#include "clipboard.hpp"
 #include "logging.hpp"
 
-// ---------------- Cross-platform clipboard helpers ----------------
-static bool run_writer_with_stdin(const std::vector<const char*>& argv, const std::string& input) {
 #if defined(_WIN32)
-    (void)argv; (void)input;
-    return false; // Will not be used on Windows.
-#else
+#include <windows.h>
+#endif
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#include <sys/wait.h>
+#endif
+
+// ---------------- Cross-platform clipboard helpers ----------------
+#if !defined(_WIN32)
+static bool run_writer_with_stdin(const std::vector<const char*>& argv, // !WIN32
+    const std::string& input)
+{
     int pipefd[2];
     if (pipe(pipefd) != 0) return false;
 
     pid_t pid = fork();
     if (pid < 0) {
-        close(pipefd[0]); close(pipefd[1]);
+        close(pipefd[0]);
+        close(pipefd[1]);
         return false;
     }
+
     if (pid == 0) {
         // child: replace stdin with read end
         dup2(pipefd[0], STDIN_FILENO);
         close(pipefd[0]);
         close(pipefd[1]);
 
-        // build argv for exec
         std::vector<char*> args;
+        args.reserve(argv.size() + 1);
         for (auto p : argv) args.push_back(const_cast<char*>(p));
         args.push_back(nullptr);
-        // execvp is safe here because argv[0] is a literal from code or user-checked path
+
         execvp(args[0], args.data());
-        _exit(127); // exec failed
+        _exit(127);
     }
-    // parent: write then close write-end
+
+    // parent: write input
     close(pipefd[0]);
-    ssize_t to_write = (ssize_t)input.size();
-    const char* buf = input.data();
-    while (to_write > 0) {
-        ssize_t w = write(pipefd[1], buf, to_write);
+    ssize_t remaining = static_cast<ssize_t>(input.size());
+    const char* ptr = input.data();
+
+    while (remaining > 0) {
+        ssize_t w = write(pipefd[1], ptr, remaining);
         if (w <= 0) break;
-        buf += w;
-        to_write -= w;
+        ptr += w;
+        remaining -= w;
     }
     close(pipefd[1]);
 
     int status = 0;
     waitpid(pid, &status, 0);
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-#endif
 }
 
-static bool run_reader_to_string(const std::vector<const char*>& argv, std::string& out) {
-#if defined(_WIN32)
-    (void)argv; (void)out;
-    return false;
-#else
+static bool run_reader_to_string(const std::vector<const char*>& argv, // !WIN32
+    std::string& out)
+{
     int pipefd[2];
     if (pipe(pipefd) != 0) return false;
 
     pid_t pid = fork();
-    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return false; }
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return false;
+    }
+
     if (pid == 0) {
-        // child: replace stdout with write end
+        // child: stdout -> pipe write end
         dup2(pipefd[1], STDOUT_FILENO);
-        close(pipefd[0]); close(pipefd[1]);
+        close(pipefd[0]);
+        close(pipefd[1]);
+
         std::vector<char*> args;
+        args.reserve(argv.size() + 1);
         for (auto p : argv) args.push_back(const_cast<char*>(p));
         args.push_back(nullptr);
+
         execvp(args[0], args.data());
         _exit(127);
     }
-    // parent: read
+
+    // parent: read from pipe
     close(pipefd[1]);
     std::string s;
     char buf[4096];
     ssize_t r;
+    size_t max_size = 1024 * 1024; // 1 MB cap
+
     while ((r = read(pipefd[0], buf, sizeof(buf))) > 0) {
+        if (s.size() + static_cast<size_t>(r) > max_size) {
+            // Avoid insane sizes; truncate
+            s.append(buf, buf + (max_size - s.size()));
+            break;
+        }
         s.append(buf, buf + r);
-        if (s.size() > 1024 * 1024) break; // avoid insane size
     }
     close(pipefd[0]);
+
     int status = 0;
     waitpid(pid, &status, 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return false;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return false;
+    }
+
     // trim trailing newlines
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
-    out.swap(s);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) {
+        s.pop_back();
+    }
+
+    out = std::move(s);
     return true;
+}
 #endif
-}
 
-// Windows section ---------------
-#if defined(_WIN32)
-static bool clipboard_set_win(const std::string& data) {
-    if (!OpenClipboard(nullptr)) return false;
-    EmptyClipboard();
 
-    int wlen = MultiByteToWideChar(
-        CP_UTF8, 0, data.c_str(), -1, nullptr, 0
-    );
-    if (wlen <= 0) { CloseClipboard(); return false; }
+// ---------------- Platform detection for WSL ----------------
+bool running_in_wsl() {
+    FILE* f = fopen("/proc/version", "r");
+    if (!f) return false;
 
-    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, wlen * sizeof(wchar_t));
-    if (!h) { CloseClipboard(); return false; }
+    char buf[256];
+    size_t nread = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
 
-    wchar_t* wdata = (wchar_t*)GlobalLock(h);
-    MultiByteToWideChar(CP_UTF8, 0, data.c_str(), -1, wdata, wlen);
-    GlobalUnlock(h);
+    if (nread == 0) {
+        // could not read - not WSL
+        return false;
+    }
 
-    SetClipboardData(CF_UNICODETEXT, h);
-    CloseClipboard();
-    return true;
+    buf[nread] = '\0';
+
+    return (strstr(buf, "Microsoft") || strstr(buf, "WSL"));
 }
 
 
-static bool clipboard_get_win(std::string& out) {
-    out.clear();
-    if (!OpenClipboard(nullptr)) return false;
+// ---------------- Clipboard operations ----------------
+bool wsl_clipboard_history_enabled() {
+    const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+    if (access(pwsh, X_OK) != 0) return false; // not WSL or no pwsh
 
-    HANDLE h = GetClipboardData(CF_UNICODETEXT);
-    if (!h) { CloseClipboard(); return false; }
+    std::vector<const char*> args = {
+        pwsh,
+        "-NoProfile",
+        "-Command",
+        "(Get-ItemProperty HKCU:\\Software\\Microsoft\\Clipboard).EnableClipboardHistory"
+    };
 
-    wchar_t* wdata = (wchar_t*)GlobalLock(h);
-    if (!wdata) { CloseClipboard(); return false; }
+    std::string out;
+    if (!run_reader_to_string(args, out)) return false;
 
-    // UTF-16 → UTF-8
-    int len = WideCharToMultiByte(
-        CP_UTF8, 0, wdata, -1, nullptr, 0, nullptr, nullptr
-    );
-
-    std::string utf8(len - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wdata, -1, utf8.data(), len, nullptr, nullptr);
-
-    out = utf8;
-
-    GlobalUnlock(h);
-    CloseClipboard();
-    return true;
-}
-
-static bool clipboard_clear_win() {
-    if (!OpenClipboard(nullptr)) return false;
-    bool ok = EmptyClipboard();
-    CloseClipboard();
-    return ok;
+    return (out == "1");
 }
 
 bool windows_clipboard_history_enabled() {
+#if defined(_WIN32)
     HKEY hKey;
     DWORD value = 0;
     DWORD size = sizeof(value);
@@ -176,177 +192,139 @@ bool windows_clipboard_history_enabled() {
     return (value == 1);
 }
 #endif
-// ----------------
 
-// WSL section ---------------
-bool running_in_wsl() {
-    FILE* f = fopen("/proc/version", "r");
-    if (!f) return false;
-
-    char buf[256];
-    size_t nread = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-
-    if (nread == 0) {
-        // Could not read; assume not WSL.
+bool clipboard_set(const std::string& data) {
+#if defined(_WIN32)
+    if (!OpenClipboard(nullptr)) {
+        audit_log_level(LogLevel::WARN,
+            "clipboard_set: OpenClipboard failed",
+            "clipboard_module",
+            "failure");
+        return false;
+    }
+    if (!EmptyClipboard()) {
+        CloseClipboard();
+        audit_log_level(LogLevel::WARN,
+            "clipboard_set: EmptyClipboard failed",
+            "clipboard_module",
+            "failure");
         return false;
     }
 
-    buf[nread] = '\0';  // explicit NUL-termination
-
-    return (strstr(buf, "Microsoft") || strstr(buf, "WSL"));
-}
-
-bool wsl_clipboard_history_enabled() {
-    const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
-    if (access(pwsh, X_OK) != 0) return false; // not WSL or no pwsh
-
-    std::vector<const char*> args = {
-        pwsh,
-        "-NoProfile",
-        "-Command",
-        "(Get-ItemProperty HKCU:\\Software\\Microsoft\\Clipboard).EnableClipboardHistory"
-    };
-
-    std::string out;
-    if (!run_reader_to_string(args, out)) return false;
-
-    // PowerShell outputs e.g. "1" or "0" or empty
-    return (out == "1");
-}
-// ----------------
-
-static bool clipboard_set_posix(const std::string& data) {
-    // prefer wl-copy (Wayland), then pbcopy (macOS), then xclip/xsel
-    const std::vector<std::vector<const char*>> writers = {
-        { "wl-copy", "--no-newline" },      // wl-copy doesn't add newline if we pass option
-        { "pbcopy" },                       // macOS
-        { "xclip", "-selection", "clipboard" },
-        { "xsel", "--clipboard", "--input" }
-    };
-    for (const auto& a : writers) {
-        if (access(a[0], X_OK) == 0) {
-            if (run_writer_with_stdin(a, data)) return true;
-        }
-    }
-    // WSL integration
-    if (running_in_wsl()) {
-        const char* winclip = "/mnt/c/Windows/System32/clip.exe";
-        const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
-        if (access(winclip, X_OK) == 0 && access(pwsh, X_OK) == 0) {
-            std::vector<const char*> args = { winclip };
-            return run_writer_with_stdin(args, data);
-        }
-    }
-    return false;
-}
-
-static bool clipboard_get_posix(std::string& out) {
-    const std::vector<std::vector<const char*>> readers = {
-        { "wl-paste", "--no-newline" },
-        { "pbpaste" },
-        { "xclip", "-selection", "clipboard", "-o" },
-        { "xsel", "--clipboard", "--output" }
-    };
-    for (const auto& a : readers) {
-        if (access(a[0], X_OK) == 0) {
-            if (run_reader_to_string(a, out)) return true;
-        }
+    size_t len = data.size();
+    HGLOBAL hglb = GlobalAlloc(GMEM_MOVEABLE, len + 1);
+    if (!hglb) {
+        CloseClipboard();
+        return false;
     }
 
-    // WSL integration
-    if (running_in_wsl()) {
-        const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
-        if (access(pwsh, X_OK) == 0) {
-            std::vector<const char*> args = {
-                pwsh,
-                "-NoProfile",
-                "-Command",
-                "Get-Clipboard"
-            };
-            return run_reader_to_string(args, out);
-        }
+    char* dst = static_cast<char*>(GlobalLock(hglb));
+    if (!dst) {
+        GlobalFree(hglb);
+        CloseClipboard();
+        return false;
     }
-    return false;
-}
 
-static bool clipboard_clear_posix() {
-    // Clearing: set empty string
-    return clipboard_set_posix(std::string());
+    memcpy(dst, data.data(), len);
+    dst[len] = '\0';
+    GlobalUnlock(hglb);
 
-    // WSL: clear Windows clipboard via clip.exe
-    if (running_in_wsl()) {
-        const char* winclip = "/mnt/c/Windows/System32/clip.exe";
-        if (access(winclip, X_OK) == 0) {
-            std::vector<const char*> args = { winclip };
-            return run_writer_with_stdin(args, "");
-        }
+    if (!SetClipboardData(CF_TEXT, hglb)) {
+        GlobalFree(hglb);
+        CloseClipboard();
+        return false;
     }
-}
 
-// High-level small wrappers:
-bool clipboard_set(const std::string& data) {
-#if defined(_WIN32)
-    return clipboard_set_win(data);
+    CloseClipboard();
+    return true;
 #else
-    return clipboard_set_posix(data);
+    const char* wayland = std::getenv("WAYLAND_DISPLAY");
+    std::vector<const char*> cmd;
+    if (wayland && *wayland) {
+        cmd = { "wl-copy" };
+    }
+    else {
+        cmd = { "xclip", "-selection", "clipboard" };
+    }
+
+    bool ok = run_writer_with_stdin(cmd, data);
+    if (!ok) {
+        audit_log_level(LogLevel::WARN,
+            "clipboard_set: external tool failed",
+            "clipboard_module",
+            "failure");
+    }
+    return ok;
 #endif
 }
 
 bool clipboard_get(std::string& out) {
 #if defined(_WIN32)
-    return clipboard_get_win(out);
+    if (!OpenClipboard(nullptr)) return false;
+    HANDLE h = GetClipboardData(CF_TEXT);
+    if (!h) {
+        CloseClipboard();
+        return false;
+    }
+    const char* src = static_cast<const char*>(GlobalLock(h));
+    if (!src) {
+        CloseClipboard();
+        return false;
+    }
+
+    out.assign(src);
+    GlobalUnlock(h);
+    CloseClipboard();
+    return true;
 #else
-    return clipboard_get_posix(out);
+    const char* wayland = std::getenv("WAYLAND_DISPLAY");
+    std::vector<const char*> cmd;
+    if (wayland && *wayland) {
+        cmd = { "wl-paste" };
+    }
+    else {
+        cmd = { "xclip", "-selection", "clipboard", "-o" };
+    }
+
+    std::string tmp;
+    if (!run_reader_to_string(cmd, tmp)) {
+        audit_log_level(LogLevel::WARN,
+            "clipboard_get: external tool failed",
+            "clipboard_module",
+            "failure");
+        return false;
+    }
+    out = std::move(tmp);
+    return true;
 #endif
 }
 
 bool clipboard_clear() {
-#if defined(_WIN32)
-    return clipboard_clear_win();
-#else
-    return clipboard_clear_posix();
-#endif
+    return clipboard_set(std::string{});
 }
 
-// copy with timed clear: copies data to clipboard and clears after `seconds` only if the
-// clipboard still contains identical content. zeroes local buffers used.
-void copy_with_timed_clear(const std::string& secret, unsigned seconds) {
-    if (secret.empty()) return;
-    std::vector<unsigned char> buf(secret.begin(), secret.end());
-    bool ok = false;
-#if defined(_WIN32)
-    std::string tmp((char*)buf.data(), buf.size());
-    ok = clipboard_set(tmp);
-    sodium_memzero((void*)tmp.data(), tmp.size());
-#else
-    std::string tmp((char*)buf.data(), buf.size());
-    ok = clipboard_set(tmp);
-    sodium_memzero((void*)tmp.data(), tmp.size());
-#endif
-    sodium_memzero(buf.data(), buf.size());
-    buf.clear();
 
-    if (!ok) {
-        audit_log_level(LogLevel::WARN, "clipboard_set failed for timed copy", "clipboard_module", "failure");
+// ---------------- Copy with timed clear ----------------
+void copy_with_timed_clear(const std::string& secret, unsigned seconds) {
+    if (!clipboard_set(secret)) {
+        std::cout << "Failed to copy to clipboard.\n";
         return;
     }
 
     std::thread([secret, seconds]() {
         std::this_thread::sleep_for(std::chrono::seconds(seconds));
+
+        // only clear if clipboard still contains the same secret
         std::string current;
         if (!clipboard_get(current)) {
             return;
         }
-        std::string expected = secret;
-        // compare exactly, if matches, clear
-        if (current == expected) {
+        if (current == secret) {
             clipboard_clear();
-            audit_log_level(LogLevel::INFO, "Clipboard cleared after timeout", "clipboard_module", "success");
-        }
-        // wipe current
-        if (!current.empty()) {
-            sodium_memzero(&current[0], current.size());
+            audit_log_level(LogLevel::INFO,
+                "Clipboard cleared after timeout",
+                "clipboard_module",
+                "success");
         }
         }).detach();
 }
