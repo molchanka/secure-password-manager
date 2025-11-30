@@ -4,8 +4,9 @@
 
 #include <atomic>
 #include <thread>
-#include <chrono>
 #include <functional>
+#include <string>
+#include <vector>
 
 // ---------- SessionID ----------
 std::string generate_session_id();
