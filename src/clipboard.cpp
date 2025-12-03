@@ -158,8 +158,9 @@ bool wsl_clipboard_history_enabled() {
     return (out == "1");
 }
 
-#if defined(_WIN32)
+
 bool windows_clipboard_history_enabled() {
+#if defined(_WIN32)
     HKEY hKey;
     DWORD value = 0;
     DWORD size = sizeof(value);
@@ -190,8 +191,15 @@ bool windows_clipboard_history_enabled() {
     }
 
     return (value == 1);
-}
+#else
+    if (running_in_wsl()) {
+        return wsl_clipboard_history_enabled();
+    }
+
+    return false;
 #endif
+}
+
 
 bool clipboard_set(const std::string& data) {
 #if defined(_WIN32)

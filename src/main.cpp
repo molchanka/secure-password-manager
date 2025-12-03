@@ -667,6 +667,10 @@ int main() {
                 secure_clear_vault(v);
                 break;
             }
+            if (windows_clipboard_history_enabled()) {
+                std::cout << "Caution: you have Clipboard History enabled! (Win + V)\n";
+                std::cout << "Any secret you copy will remain in there. We advise you to disable it to avoid leaking sensitive info.\n";
+            }
             if (clipboard_set(it->second.password)) {
                 std::cout << "Password copied to clipboard for 15 seconds.\n";
                 copy_with_timed_clear(it->second.password, 15);
