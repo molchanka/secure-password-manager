@@ -358,6 +358,7 @@ int main() {
         g_reset_timer = true;
 
         int opt = parse_choice(choice);
+        g_reset_timer = true;
         switch (opt) {
         case 1: {
             audit_log_level(LogLevel::INFO,
@@ -368,6 +369,7 @@ int main() {
             if (!load_vault_decrypted(key.data(), nonce, v)) {
                 std::cerr << "An unexpected error occurred. Check audit log.\n";
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
             std::cout << "Stored credentials:\n";
@@ -375,6 +377,7 @@ int main() {
                 std::cout << " - " << p.first << "\n";
             }
             secure_clear_vault(v);
+            g_reset_timer = true;
             break;
         }
         case 2: {
@@ -382,12 +385,16 @@ int main() {
             if (!load_vault_decrypted(key.data(), nonce, v)) {
                 std::cerr << "An unexpected error occurred. Check audit log.\n";
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
             std::string label, user, notes;
-            std::cout << "+New - Label: ";
-            if (!std::getline(std::cin, label)) break;
             g_reset_timer = true;
+            std::cout << "+New - Label: ";
+            if (!std::getline(std::cin, label)) {
+                g_reset_timer = true;
+                break;
+            }
             if (!valid_label_or_username(label)) {
                 std::cout << "Invalid label\n";
                 audit_log_level(LogLevel::WARN,
@@ -395,11 +402,15 @@ int main() {
                     "add_cred",
                     "failure");
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
-            std::cout << " Username: ";
-            if (!std::getline(std::cin, user)) break;
             g_reset_timer = true;
+            std::cout << " Username: ";
+            if (!std::getline(std::cin, user)) {
+                g_reset_timer = true;
+                break;
+            }
             if (!valid_label_or_username(user)) {
                 std::cout << "Invalid username\n";
                 audit_log_level(LogLevel::WARN,
@@ -407,10 +418,11 @@ int main() {
                     "add_cred",
                     "failure");
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
-            SecureBuffer pw_vec = get_password_secure(" Password: ");
             g_reset_timer = true;
+            SecureBuffer pw_vec = get_password_secure(" Password: ");
             if (pw_vec.size() == 0 || pw_vec.size() > MAX_PASS_LEN) {
                 std::cout << "Invalid password\n";
                 audit_log_level(LogLevel::WARN,
@@ -421,11 +433,15 @@ int main() {
                     sodium_memzero(pw_vec.data(), pw_vec.size());
                 }
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
-            std::cout << " Notes (optional): ";
-            if (!std::getline(std::cin, notes)) break;
             g_reset_timer = true;
+            std::cout << " Notes (optional): ";
+            if (!std::getline(std::cin, notes)) {
+                g_reset_timer = true;
+                break;
+            }
             if (notes.size() > MAX_NOTES_LEN) {
                 std::cout << "Notes too long\n";
                 audit_log_level(LogLevel::WARN,
@@ -436,6 +452,7 @@ int main() {
                     sodium_memzero(pw_vec.data(), pw_vec.size());
                 }
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
             std::string pw(reinterpret_cast<char*>(pw_vec.data()), pw_vec.size());
@@ -448,15 +465,18 @@ int main() {
             v[label] = std::move(c);
             if (!save_vault_encrypted(key.data(), salt, nonce, v)) {
                 std::cerr << "An unexpected error occurred. Check audit log.\n";
+                g_reset_timer = true;
             }
             else {
                 audit_log_level(LogLevel::INFO,
                     std::string("Credential added: ") + label,
                     "add_cred",
                     "success");
+                g_reset_timer = true;
             }
             if (!pw.empty()) sodium_memzero(&pw[0], pw.size());
             secure_clear_vault(v);
+            g_reset_timer = true;
             break;
         }
         case 3: {
@@ -464,12 +484,16 @@ int main() {
             if (!load_vault_decrypted(key.data(), nonce, v)) {
                 std::cerr << "An unexpected error occurred. Check audit log.\n";
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
             std::string label;
-            std::cout << "Update - Label: ";
-            if (!std::getline(std::cin, label)) break;
             g_reset_timer = true;
+            std::cout << "Update - Label: ";
+            if (!std::getline(std::cin, label)) {
+                g_reset_timer = true;
+                break;
+            }
             auto it = v.find(label);
             if (it == v.end()) {
                 std::cout << "Not found\n";
@@ -478,10 +502,11 @@ int main() {
                     "upd_cred",
                     "failure");
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
-            SecureBuffer oldpw_vec = get_password_secure("Old password: ");
             g_reset_timer = true;
+            SecureBuffer oldpw_vec = get_password_secure("Old password: ");
             if (oldpw_vec.size() == 0 || oldpw_vec.size() > MAX_PASS_LEN) {
                 std::cout << "Invalid old password\n";
                 audit_log_level(LogLevel::WARN,
@@ -492,6 +517,7 @@ int main() {
                     sodium_memzero(oldpw_vec.data(), oldpw_vec.size());
                 }
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
             bool match = false;
@@ -500,6 +526,7 @@ int main() {
                     oldpw_vec.data(),
                     reinterpret_cast<const byte*>(it->second.password.data()),
                     oldpw_vec.size()) == 0);
+                g_reset_timer = true;
             }
             sodium_memzero(oldpw_vec.data(), oldpw_vec.size());
             if (!match) {
@@ -509,10 +536,11 @@ int main() {
                     "failure");
                 std::cout << "Old password mismatch\n";
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
-            SecureBuffer newpw_vec = get_password_secure("New password: ");
             g_reset_timer = true;
+            SecureBuffer newpw_vec = get_password_secure("New password: ");
             if (newpw_vec.size() == 0 || newpw_vec.size() > MAX_PASS_LEN) {
                 std::cout << "Invalid new password\n";
                 audit_log_level(LogLevel::WARN,
@@ -523,6 +551,7 @@ int main() {
                     sodium_memzero(newpw_vec.data(), newpw_vec.size());
                 }
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
             std::string newpw(reinterpret_cast<char*>(newpw_vec.data()), newpw_vec.size());
@@ -530,15 +559,18 @@ int main() {
             it->second.password = newpw;
             if (!save_vault_encrypted(key.data(), salt, nonce, v)) {
                 std::cerr << "An unexpected error occurred. Check audit log.\n";
+                g_reset_timer = true;
             }
             else {
                 audit_log_level(LogLevel::INFO,
                     std::string("Update success for: ") + label,
                     "upd_cred",
                     "success");
+                g_reset_timer = true;
             }
             if (!newpw.empty()) sodium_memzero(&newpw[0], newpw.size());
             secure_clear_vault(v);
+            g_reset_timer = true;
             break;
         }
         case 4: {
@@ -546,12 +578,16 @@ int main() {
             if (!load_vault_decrypted(key.data(), nonce, v)) {
                 std::cerr << "An unexpected error occurred. Check audit log.\n";
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
             std::string label;
-            std::cout << "Delete - Label: ";
-            if (!std::getline(std::cin, label)) break;
             g_reset_timer = true;
+            std::cout << "Delete - Label: ";
+            if (!std::getline(std::cin, label)) {
+                g_reset_timer = true;
+                break;
+            }
             auto it = v.find(label);
             if (it == v.end()) {
                 std::cout << "Not found\n";
@@ -560,20 +596,22 @@ int main() {
                     "del_cred",
                     "failure");
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
             audit_log_level(LogLevel::INFO,
                 std::string("Deletion attempt for: ") + label,
                 "del_cred",
                 "notify");
-            SecureBuffer confirm = get_password_secure("Type MASTER password to confirm deletion: ");
             g_reset_timer = true;
+            SecureBuffer confirm = get_password_secure("Type MASTER password to confirm deletion: ");
             if (confirm.size() == 0 || is_all_space(confirm)) {
                 std::cout << "Invalid input\n";
                 secure_clear_vault(v);
                 if (confirm.size() != 0) {
                     sodium_memzero(confirm.data(), confirm.size());
                 }
+                g_reset_timer = true;
                 break;
             }
             SecureKey verifyKey(KEY_LEN);
@@ -586,6 +624,7 @@ int main() {
                 sodium_memzero(confirm.data(), confirm.size());
                 std::cout << "Master password check failed.\n";
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
             Vault validate_vault;
@@ -598,6 +637,7 @@ int main() {
                 std::cout << "Master password check failed.\n";
                 secure_clear_vault(v);
                 secure_clear_vault(validate_vault);
+                g_reset_timer = true;
                 break;
             }
             secure_clear_vault(validate_vault);
@@ -605,14 +645,17 @@ int main() {
             v.erase(it);
             if (!save_vault_encrypted(key.data(), salt, nonce, v)) {
                 std::cerr << "An unexpected error occurred. Check audit log.\n";
+                g_reset_timer = true;
             }
             else {
                 audit_log_level(LogLevel::INFO,
                     std::string("Deletion success for: ") + label,
                     "del_cred",
                     "success");
+                g_reset_timer = true;
             }
             secure_clear_vault(v);
+            g_reset_timer = true;
             break;
         }
         case 5: {
@@ -620,12 +663,16 @@ int main() {
             if (!load_vault_decrypted(key.data(), nonce, v)) {
                 std::cerr << "An unexpected error occurred. Check audit log.\n";
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
             std::string label;
-            std::cout << "Reveal - Label: ";
-            if (!std::getline(std::cin, label)) break;
             g_reset_timer = true;
+            std::cout << "Reveal - Label: ";
+            if (!std::getline(std::cin, label)) {
+                g_reset_timer = true;
+                break;
+            }
             auto it = v.find(label);
             if (it == v.end()) {
                 std::cout << "Not found\n";
@@ -634,16 +681,19 @@ int main() {
                     "reveal_cred",
                     "failure");
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
             audit_log_level(LogLevel::INFO,
                 std::string("Revealed credential for: ") + label,
                 "reveal_cred",
                 "success");
+            g_reset_timer = true;
             std::cout << "Username: " << it->second.username << "\n";
             std::cout << "Password: " << it->second.password << "\n";
             std::cout << "Notes: " << it->second.notes << "\n";
             secure_clear_vault(v);
+            g_reset_timer = true;
             break;
         }
         case 6: {
@@ -651,12 +701,16 @@ int main() {
             if (!load_vault_decrypted(key.data(), nonce, v)) {
                 std::cerr << "An unexpected error occurred. Check audit log.\n";
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
             }
             std::string label;
-            std::cout << "Copy - Label: ";
-            if (!std::getline(std::cin, label)) break;
             g_reset_timer = true;
+            std::cout << "Copy - Label: ";
+            if (!std::getline(std::cin, label)) {
+                g_reset_timer = true;
+                break;
+            }
             auto it = v.find(label);
             if (it == v.end()) {
                 std::cout << "Not found\n";
@@ -665,7 +719,13 @@ int main() {
                     "clip_cred",
                     "failure");
                 secure_clear_vault(v);
+                g_reset_timer = true;
                 break;
+            }
+            if (windows_clipboard_history_enabled()) {
+                std::cout << "Caution: you have Clipboard History enabled! (Win + V)\n";
+                std::cout << "Any secret you copy will remain in there. We advise you to disable it to avoid leaking sensitive info.\n";
+                g_reset_timer = true;
             }
             if (clipboard_set(it->second.password)) {
                 std::cout << "Password copied to clipboard for 15 seconds.\n";
@@ -674,6 +734,7 @@ int main() {
                     std::string("Clipboard copy success for: ") + label,
                     "clip_cred",
                     "success");
+                g_reset_timer = true;
             }
             else {
                 std::cout << "Failed to copy to clipboard.\n";
@@ -681,8 +742,10 @@ int main() {
                     std::string("Clipboard copy failed for: ") + label,
                     "clip_cred",
                     "failure");
+                g_reset_timer = true;
             }
             secure_clear_vault(v);
+            g_reset_timer = true;
             break;
         }
         case 7: {
@@ -691,9 +754,16 @@ int main() {
         }
         case 8: {
             std::cout << "This will delete the entire vault, audit log and metadata.\n";
+            g_reset_timer = true;
+            std::string del;
+            std::cout << "Type DELETE if you want to proceed: ";
+            if ((!std::getline(std::cin, del)) || del != "DELETE") {
+                std::cout << "Aborted.\n";
+                g_reset_timer = true;
+                break;
+            }
             SecureBuffer masterCheck =
                 get_password_secure("Type MASTER password to confirm vault delete: ");
-            g_reset_timer = true;
             if (masterCheck.size() == 0 || is_all_space(masterCheck)) {
                 std::cout << "Invalid master password.\n";
                 audit_log_level(LogLevel::WARN,
@@ -703,6 +773,7 @@ int main() {
                 if (masterCheck.size() != 0) {
                     sodium_memzero(masterCheck.data(), masterCheck.size());
                 }
+                g_reset_timer = true;
                 break;
             }
             SecureKey verifyKey(KEY_LEN);
@@ -716,6 +787,7 @@ int main() {
                     sodium_memzero(masterCheck.data(), masterCheck.size());
                 }
                 std::cout << "Key derivation failed.\n";
+                g_reset_timer = true;
                 break;
             }
             Vault test;
@@ -729,10 +801,12 @@ int main() {
                 }
                 std::cout << "Incorrect master password. Aborted.\n";
                 secure_clear_vault(test);
+                g_reset_timer = true;
                 break;
             }
             if (masterCheck.size() != 0) {
                 sodium_memzero(masterCheck.data(), masterCheck.size());
+                g_reset_timer = true;
             }
             secure_clear_vault(test);
             secure_delete_file(g_vault_filename.c_str());
@@ -748,6 +822,7 @@ int main() {
         }
         default:
             std::cout << "Unknown option\n";
+            g_reset_timer = true;
             break;
         }
     }

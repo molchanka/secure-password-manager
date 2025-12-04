@@ -19,9 +19,7 @@ bool clipboard_clear();
 // Copy with timed clear
 void copy_with_timed_clear(const std::string& secret, unsigned seconds);
 
-#if defined(_WIN32)
 bool windows_clipboard_history_enabled();
-#endif
 
 // WSL detection and clipboard history detection
 bool wsl_clipboard_history_enabled();

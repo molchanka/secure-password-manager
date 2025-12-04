@@ -39,6 +39,9 @@ Secure password manager for personal use, written using C++ and secured using va
 - **C++17 or newer**
 - **libsodium** for cryptographic operations
 
+For native Linux:
+- **wl-clipboard** or **xclip**
+
 ### Install dependencies
 
 Ubuntu / Debian / WSL
@@ -50,6 +53,11 @@ sudo apt install g++ libsodium-dev
 Fedora
 ```bash
 sudo dnf install g++ libsodium-devel
+```
+
+On native Linux, ensure that you either have Wayland or X11 installed - othewise the clipboard will not work for you:
+```bash
+sudo apt install wl-clipboard xclip
 ```
 
 ## Security notes

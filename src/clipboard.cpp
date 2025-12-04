@@ -158,6 +158,7 @@ bool wsl_clipboard_history_enabled() {
     return (out == "1");
 }
 
+
 bool windows_clipboard_history_enabled() {
 #if defined(_WIN32)
     HKEY hKey;
@@ -172,7 +173,7 @@ bool windows_clipboard_history_enabled() {
         KEY_READ,
         &hKey) != ERROR_SUCCESS)
     {
-        return false; // key missing → treat as disabled
+        return false; // key missing - treat as disabled
     }
 
     LONG result = RegQueryValueExA(
@@ -190,8 +191,15 @@ bool windows_clipboard_history_enabled() {
     }
 
     return (value == 1);
+#else
+    if (running_in_wsl()) {
+        return wsl_clipboard_history_enabled();
+    }
+
+    return false;
 #endif
 }
+
 
 bool clipboard_set(const std::string& data) {
 #if defined(_WIN32)
@@ -238,6 +246,23 @@ bool clipboard_set(const std::string& data) {
     CloseClipboard();
     return true;
 #else
+    if (running_in_wsl()) {
+        const char* clip = "/mnt/c/Windows/System32/clip.exe";
+
+        // clip.exe must exist and be executable
+        if (access(clip, X_OK) == 0) {
+            std::vector<const char*> cmd = { clip };
+            bool ok = run_writer_with_stdin(cmd, data);
+            if (!ok) {
+                audit_log_level(LogLevel::WARN,
+                    "clipboard_set: clip.exe failed",
+                    "clipboard_module",
+                    "failure");
+            }
+            return ok;
+        }
+    }
+
     const char* wayland = std::getenv("WAYLAND_DISPLAY");
     std::vector<const char*> cmd;
     if (wayland && *wayland) {
@@ -277,6 +302,31 @@ bool clipboard_get(std::string& out) {
     CloseClipboard();
     return true;
 #else
+    if (running_in_wsl()) {
+        const char* pwsh = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+
+        if (access(pwsh, X_OK) == 0) {
+            std::vector<const char*> cmd = {
+                pwsh,
+                "-NoProfile",
+                "-Command",
+                "Get-Clipboard"
+            };
+
+            std::string tmp;
+            if (run_reader_to_string(cmd, tmp)) {
+                out = std::move(tmp);
+                return true;
+            }
+
+            audit_log_level(LogLevel::WARN,
+                "clipboard_get: PowerShell Get-Clipboard failed",
+                "clipboard_module",
+                "failure");
+            return false;
+        }
+    }
+
     const char* wayland = std::getenv("WAYLAND_DISPLAY");
     std::vector<const char*> cmd;
     if (wayland && *wayland) {
