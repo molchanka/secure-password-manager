@@ -39,6 +39,9 @@ Secure password manager for personal use, written using C++ and secured using va
 - **C++17 or newer**
 - **libsodium** for cryptographic operations
 
+For native Linux:
+- **wl-clipboard** or **xclip**
+
 ### Install dependencies
 
 Ubuntu / Debian / WSL
