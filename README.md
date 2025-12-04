@@ -52,6 +52,11 @@ Fedora
 sudo dnf install g++ libsodium-devel
 ```
 
+On native Linux, ensure that you either have Wayland or X11 installed - othewise the clipboard will not work for you:
+```bash
+sudo apt install wl-clipboard xclip
+```
+
 ## Security notes
 
 This is a learning-based implementation, not a production password manager. It demonstrates principles from the Secure Programming and Cryptography courses.
