@@ -33,23 +33,6 @@ std::string g_audit_log_path;
 
 // ---------- Path helpers ----------
 static std::string get_user_home_dir() {
-#if defined(_WIN32)
-    char path[MAX_PATH];
-    if (SHGetFolderPathA(NULL, CSIDL_PROFILE, NULL, 0, path) == S_OK) {
-        return std::string(path);
-    }
-    const char* home = std::getenv("USERPROFILE");
-    if (home && *home) {
-        return std::string(home);
-    }
-    home = std::getenv("HOMEPATH");
-    if (home && *home) {
-        const char* drive = std::getenv("HOMEDRIVE");
-        std::string base = (drive && *drive) ? std::string(drive) : std::string("C:");
-        return base + std::string(home);
-    }
-    return ".";
-#else
     const char* home = std::getenv("HOME");
     if (!home || !*home) {
         struct passwd* pw = getpwuid(geteuid());
@@ -59,17 +42,9 @@ static std::string get_user_home_dir() {
 }
     if (!home || !*home) return ".";
     return std::string(home);
-#endif
 }
 
 static bool ensure_dir_exists(const std::string& path, mode_t mode) {
-#if defined(_WIN32)
-    if (_mkdir(path.c_str()) != 0 && errno != EEXIST) {
-        std::cerr << "Failed to create directory " << path << ": " << strerror(errno) << "\n";
-        return false;
-    }
-    return true;
-#else
     struct stat st;
     if (stat(path.c_str(), &st) == 0) {
         if (!S_ISDIR(st.st_mode)) {
@@ -88,15 +63,10 @@ static bool ensure_dir_exists(const std::string& path, mode_t mode) {
         }
     }
     return true;
-#endif
 }
 
 // -------- Ownership and permission checks ----------
 bool check_dir_ownership_and_perms(const std::string& path) {
-#if defined(_WIN32)
-    (void)path;
-    return true;
-#else
     struct stat st;
     if (stat(path.c_str(), &st) != 0) {
         std::cerr << "Internal error: vault file check failed.\n";
@@ -122,15 +92,9 @@ bool check_dir_ownership_and_perms(const std::string& path) {
         return false;
     }
     return true;
-#endif
 }
 
 bool check_file_ownership_and_perms(const std::string& path, bool allow_missing) {
-#if defined(_WIN32)
-    (void)path;
-    (void)allow_missing;
-    return true;
-#else
     struct stat st;
     if (stat(path.c_str(), &st) != 0) {
         if (errno == ENOENT && allow_missing) return true;
@@ -156,22 +120,15 @@ bool check_file_ownership_and_perms(const std::string& path, bool allow_missing)
         return false;
     }
     return true;
-#endif
 }
 
 
 // ---------- Multi-vault initialization ----------
 bool init_vault_paths() {
     std::string home = get_user_home_dir();
-#if defined(_WIN32)
-    const char sep = '\\';
-    g_vault_root = home + "\\.passman";
-    std::string vaults_dir = g_vault_root + "\\vaults";
-#else
     const char sep = '/';
     g_vault_root = home + "/.passman";
     std::string vaults_dir = g_vault_root + "/vaults";
-#endif
 
     if (!ensure_dir_exists(g_vault_root, S_IRWXU)) {
         return false;
@@ -212,15 +169,9 @@ bool init_vault_paths() {
         return false;
     }
 
-#if defined(_WIN32)
-    g_vault_filename = g_vault_dir + "\\vault.bin";
-    g_meta_filename = g_vault_dir + "\\vault.meta";
-    g_audit_log_path = g_vault_dir + "\\audit.log";
-#else
     g_vault_filename = g_vault_dir + "/vault.bin";
     g_meta_filename = g_vault_dir + "/vault.meta";
     g_audit_log_path = g_vault_dir + "/audit.log";
-#endif
 
     // enforce per-user ownership and tight perms on dir
     if (!check_dir_ownership_and_perms(g_vault_dir)) {
@@ -251,33 +202,6 @@ bool atomic_write_file(const std::string& path, const byte* buf, size_t len) {
     std::vector<char> temp(tmpl.begin(), tmpl.end());
     temp.push_back('\0');
 
-#if defined(_WIN32)
-    char tmpPath[MAX_PATH];
-    if (!GetTempFileNameA(".", "vlt", 0, tmpPath)) {
-        std::cerr << "GetTempFileName failed\n";
-        return false;
-    }
-    std::string tmpFile = tmpPath;
-    FILE* f = fopen(tmpFile.c_str(), "wb");
-    if (!f) {
-        std::cerr << "fopen(tmp) failed\n";
-        return false;
-    }
-    if (len > 0 && fwrite(buf, 1, len, f) != len) {
-        std::cerr << "write(tmp) failed\n";
-        fclose(f);
-        std::remove(tmpFile.c_str());
-        return false;
-    }
-    fflush(f);
-    fclose(f);
-    if (std::rename(tmpFile.c_str(), path.c_str()) != 0) {
-        std::cerr << "rename failed\n";
-        std::remove(tmpFile.c_str());
-        return false;
-    }
-    return true;
-#else
     int fd = mkostemp(temp.data(), O_CLOEXEC);
     if (fd < 0) {
         std::cerr << "mkostemp failed\n";
@@ -309,7 +233,6 @@ bool atomic_write_file(const std::string& path, const byte* buf, size_t len) {
         return false;
     }
     return true;
-#endif
 }
 
 
@@ -489,8 +412,6 @@ bool load_vault_ciphertext(std::vector<byte>& ct) {
 // -------- Secure deletion --------
 void secure_delete_file(const char* path) {
     if (!path) return;
-
-#if !defined(_WIN32)
     struct stat st;
     if (lstat(path, &st) != 0) {
         unlink(path);
@@ -512,7 +433,6 @@ void secure_delete_file(const char* path) {
             "failure");
         return;
     }
-#endif
 
     FILE* f = fopen(path, "r+");
     if (!f) {
@@ -520,7 +440,6 @@ void secure_delete_file(const char* path) {
         return;
     }
 
-#if !defined(_WIN32)
     long lsz = st.st_size;
     if (lsz > 0 && (unsigned long)lsz <= MAX_VAULT_SIZE) {
         rewind(f);
@@ -529,17 +448,6 @@ void secure_delete_file(const char* path) {
         fflush(f);
         fsync(fileno(f));
     }
-#else
-    if (fseek(f, 0, SEEK_END) == 0) {
-        long lsz = ftell(f);
-        if (lsz > 0 && (unsigned long)lsz <= MAX_VAULT_SIZE) {
-            rewind(f);
-            std::vector<byte> zeros((size_t)lsz, 0);
-            (void)fwrite(zeros.data(), 1, zeros.size(), f);
-            fflush(f);
-        }
-    }
-#endif
 
     fclose(f);
     std::remove(path);
