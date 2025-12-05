@@ -812,8 +812,12 @@ int main() {
             secure_delete_file(g_vault_filename.c_str());
             secure_delete_file(g_meta_filename.c_str());
             secure_delete_file(g_audit_log_path.c_str());
+            rmdir(g_vault_dir.c_str());
+            g_vault_filename.clear();
+            g_meta_filename.clear();
+            g_audit_log_path.clear();
             audit_log_level(LogLevel::ALERT,
-                "Vault deleted by user",
+                "Vault " + g_vault_name + " deleted by user",
                 "del_vault",
                 "success");
             std::cout << "Vault deleted\n";
